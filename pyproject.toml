@@ -1,0 +1,39 @@
+[project]
+name = "loom"
+version = "0.1.0"
+description = "LangGraph 2026 — Deep Agent with multi-agent orchestration, hybrid storage, and layered middleware"
+requires-python = ">=3.10"
+dependencies = [
+    "langchain>=0.3.0",
+    "langchain-openai>=0.2.0",
+    "langgraph>=0.2.0",
+    "deepagents>=0.1.0",
+    "langsmith>=0.1.0",
+    "python-dotenv>=1.0.0",
+    "tavily-python>=0.5.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+    "ipython>=8.0.0",
+]
+
+[project.scripts]
+loom = "main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent", "utils", "memory", "graphs", "evals"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]

@@ -1,0 +1,19 @@
+# Core
+langgraph
+langchain
+
+# LLM Providers
+langchain-openai
+langchain-google-genai
+langchain-qwq
+
+# Agent
+deepagents
+langsmith
+
+# Tools
+tavily-python
+
+# Utils
+python-dotenv
+pydantic
