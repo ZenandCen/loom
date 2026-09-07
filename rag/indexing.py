@@ -13,10 +13,9 @@ from pathlib import Path
 from typing import Optional
 
 from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
 
 from rag.chunking import ChunkingConfig, chunk_documents
-from rag.config import get_rag_settings
+from rag.config import get_embeddings, get_rag_settings
 from rag.enums import VectorDBType
 
 logger = logging.getLogger(__name__)
@@ -145,7 +144,7 @@ def get_vectorstore(collection_name: Optional[str] = None):
     """
     settings = get_rag_settings()
     collection_name = collection_name or settings.default_collection
-    embeddings = OpenAIEmbeddings(model=settings.embedding_model)
+    embeddings = get_embeddings()
 
     if settings.vector_db_type == VectorDBType.QDRANT:
         from langchain_qdrant import QdrantVectorStore

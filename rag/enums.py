@@ -81,3 +81,14 @@ class QualityCheckDecision(str, Enum):
 
     FINISH = "finish"
     REWRITE = "rewrite"
+
+
+class EmbeddingProvider(str, Enum):
+    """Embedding model provider.
+
+    - OPENAI: Cloud embeddings (text-embedding-3-small, etc.)
+    - OLLAMA: Local embeddings via Ollama (nomic-embed-text, etc.)
+    """
+
+    OPENAI = "openai"
+    OLLAMA = "ollama"

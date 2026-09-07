@@ -8,7 +8,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from rag.enums import ChunkingStrategy, PipelineLevel, VectorDBType
+from rag.enums import ChunkingStrategy, EmbeddingProvider, PipelineLevel, VectorDBType
 
 
 @dataclass
@@ -20,9 +20,19 @@ class RAGSettings:
     """
 
     # --- Embedding ---
-    # Model used to generate vector embeddings for documents and queries
+    # Provider: "openai" (cloud) or "ollama" (local)
+    embedding_provider: EmbeddingProvider = field(
+        default_factory=lambda: EmbeddingProvider(
+            os.getenv("RAG_EMBEDDING_PROVIDER", "ollama")
+        )
+    )
+    # Model name (OpenAI: "text-embedding-3-small" | Ollama: "nomic-embed-text:latest")
     embedding_model: str = field(
-        default_factory=lambda: os.getenv("RAG_EMBEDDING_MODEL", "text-embedding-3-small")
+        default_factory=lambda: os.getenv("RAG_EMBEDDING_MODEL", "nomic-embed-text:latest")
+    )
+    # Ollama server URL (default: local)
+    ollama_url: str = field(
+        default_factory=lambda: os.getenv("RAG_OLLAMA_URL", "http://localhost:11434")
     )
 
     # --- Vector DB ---
@@ -102,3 +112,28 @@ def get_rag_settings() -> RAGSettings:
     if _settings is None:
         _settings = RAGSettings()
     return _settings
+
+
+def get_embeddings():
+    """Factory: return the configured embedding model instance.
+
+    Supports:
+        - Ollama (local): nomic-embed-text, mxbai-embed-large, etc.
+        - OpenAI (cloud): text-embedding-3-small, etc.
+
+    Returns:
+        A LangChain-compatible embeddings instance.
+    """
+    settings = get_rag_settings()
+
+    if settings.embedding_provider == EmbeddingProvider.OLLAMA:
+        from langchain_ollama import OllamaEmbeddings
+
+        return OllamaEmbeddings(
+            model=settings.embedding_model,
+            base_url=settings.ollama_url,
+        )
+    else:  # OPENAI
+        from langchain_openai import OpenAIEmbeddings
+
+        return OpenAIEmbeddings(model=settings.embedding_model)

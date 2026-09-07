@@ -19,6 +19,7 @@ tavily-python
 # RAG
 langchain-community
 langchain-chroma
+langchain-ollama
 chromadb
 pypdf
 python-docx
