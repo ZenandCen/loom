@@ -1,6 +1,8 @@
 # Core
 langgraph
 langchain
+langchain-core
+langchain-text-splitters
 
 # LLM Providers
 langchain-openai
@@ -14,6 +16,22 @@ langsmith
 # Tools
 tavily-python
 
+# RAG
+langchain-community
+langchain-chroma
+chromadb
+pypdf
+python-docx
+beautifulsoup4
+# Optional: additional vector backends
+langchain-qdrant
+langchain-postgres
+# Optional: reranking
+cohere
+# Optional: evaluation
+ragas
+
 # Utils
 python-dotenv
 pydantic
+typer

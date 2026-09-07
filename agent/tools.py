@@ -1,9 +1,14 @@
-"""Tool definitions for the loom agent."""
+"""Tool definitions for the loom agent.
+
+Tools are the agent's hands — they interact with the external world.
+Each tool is a pure function wrapped in LangChain's @tool decorator.
+"""
 
 from langchain_core.tools import tool
 from tavily import TavilyClient
 
 from agent.config import store
+from rag.tool import all_rag_tools
 
 tavily_client = TavilyClient()
 
@@ -67,4 +72,4 @@ def recall(query: str) -> str:
 
 
 # --- Tools list (pass to agent) ---
-all_tools = [tavily_search, send_email, remember, recall]
+all_tools = [tavily_search, send_email, remember, recall, *all_rag_tools]
