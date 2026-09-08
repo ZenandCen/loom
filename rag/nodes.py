@@ -147,25 +147,22 @@ def multi_source_retrieve(state: RAGState) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 
-def grade_documents(state: RAGState) -> GradeDecision:
-    """Grade retrieved documents for relevance to the question.
+def grade_documents(state: RAGState) -> dict:
+    """Grade retrieved documents for relevance. NODE — returns state update.
 
     If no documents were retrieved, automatically triggers rewrite.
     Otherwise, uses LLM to assess if the top documents contain information
     that can answer the question.
 
-    Uses full content of top documents (up to 1000 chars each) for
-    a more accurate relevance assessment than truncated snippets.
-
     Args:
         state: Current RAG pipeline state.
 
     Returns:
-        GradeDecision.GENERATE if docs are relevant, GradeDecision.REWRITE if not.
+        State update with `grade_decision` field.
     """
     if not state.get("documents"):
         logger.info("No documents retrieved → rewrite")
-        return GradeDecision.REWRITE
+        return {"grade_decision": GradeDecision.REWRITE}
 
     # Use top 3 docs, up to 1000 chars each (enough to judge relevance)
     context = "\n\n".join(
@@ -183,23 +180,25 @@ def grade_documents(state: RAGState) -> GradeDecision:
     result = _llm.invoke(prompt).content.strip().lower()
     decision = GradeDecision.GENERATE if "yes" in result else GradeDecision.REWRITE
     logger.info(f"Grade: {decision.value}")
-    return decision
+    return {"grade_decision": decision}
 
 
-def check_hallucination(state: RAGState) -> Literal["check_quality", GradeDecision.REWRITE]:
-    """Verify that the generated answer is grounded in the retrieved context.
+def grade_router(state: RAGState) -> str:
+    """ROUTER for grade_documents. Reads decision from state."""
+    return state.get("grade_decision", GradeDecision.REWRITE).value
+
+
+def check_hallucination(state: RAGState) -> dict:
+    """Verify that the generated answer is grounded. NODE — returns state update.
 
     Detects hallucinations: claims in the answer that are not supported
     by the retrieved documents.
-
-    Uses full document content (up to 1500 chars per doc) to give the
-    LLM enough context to verify each claim in the answer.
 
     Args:
         state: Current RAG pipeline state (uses `documents` and `generation`).
 
     Returns:
-        "check_quality" if grounded, GradeDecision.REWRITE if hallucinated.
+        State update with `hallucination_result` field.
     """
     context = "\n\n".join(
         f"[{i+1}]: {d.page_content[:1500]}" for i, d in enumerate(state.get("documents", [])[:3])
@@ -217,13 +216,20 @@ def check_hallucination(state: RAGState) -> Literal["check_quality", GradeDecisi
     # Check "not_grounded" first to avoid substring match with "grounded"
     if "not_grounded" in result:
         logger.info("Hallucination detected → rewrite")
-        return GradeDecision.REWRITE
+        return {"hallucination_result": HallucinationResult.NOT_GROUNDED}
     logger.info("Answer grounded → check quality")
+    return {"hallucination_result": HallucinationResult.GROUNDED}
+
+
+def hallucination_router(state: RAGState) -> str:
+    """ROUTER for check_hallucination. Reads result from state."""
+    if state.get("hallucination_result") == HallucinationResult.NOT_GROUNDED:
+        return GradeDecision.REWRITE.value
     return "check_quality"
 
 
-def check_answer_quality(state: RAGState) -> QualityCheckDecision:
-    """Assess whether the answer is useful and complete for the question.
+def check_answer_quality(state: RAGState) -> dict:
+    """Assess whether the answer is useful. NODE — returns state update.
 
     Catches answers that are technically grounded but still inadequate
     (too vague, incomplete, or off-topic).
@@ -232,7 +238,7 @@ def check_answer_quality(state: RAGState) -> QualityCheckDecision:
         state: Current RAG pipeline state (uses `question` and `generation`).
 
     Returns:
-        QualityCheckDecision.FINISH if useful, QualityCheckDecision.REWRITE if not.
+        State update with `quality_result` field.
     """
     prompt = (
         "Is this answer useful and complete for the question?\n\n"
@@ -244,9 +250,16 @@ def check_answer_quality(state: RAGState) -> QualityCheckDecision:
     # Check "not_useful" first to avoid substring match with "useful"
     if "not_useful" in result:
         logger.info("Answer not useful → rewrite")
-        return QualityCheckDecision.REWRITE
+        return {"quality_result": QualityResult.NOT_USEFUL}
     logger.info("Answer quality OK → finish")
-    return QualityCheckDecision.FINISH
+    return {"quality_result": QualityResult.USEFUL}
+
+
+def quality_router(state: RAGState) -> str:
+    """ROUTER for check_answer_quality. Reads result from state."""
+    if state.get("quality_result") == QualityResult.NOT_USEFUL:
+        return QualityCheckDecision.REWRITE.value
+    return QualityCheckDecision.FINISH.value
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -361,3 +374,16 @@ def rewrite_query(state: RAGState) -> dict:
     logger.info(f"Query rewritten: '{state['question']}' → '{new_query}'")
 
     return {"question": new_query, "query_rewrite_count": count}
+
+
+def rewrite_router(state: RAGState) -> str:
+    """ROUTER after rewrite_query: loop back to retrieve or give up and generate.
+
+    If max rewrites reached → go to generate (best effort with current docs).
+    Otherwise → loop back to retrieve with the new query.
+    """
+    settings = get_rag_settings()
+    count = state.get("query_rewrite_count", 0)
+    if count > settings.max_rewrite_count:
+        return "generate"
+    return "retrieve"

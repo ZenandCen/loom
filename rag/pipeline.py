@@ -28,9 +28,13 @@ from rag.nodes import (
     direct_answer,
     generate,
     grade_documents,
+    grade_router,
+    hallucination_router,
     multi_source_retrieve,
+    quality_router,
     retrieve,
     rewrite_query,
+    rewrite_router,
     route_question,
 )
 from rag.state import RAGState
@@ -98,14 +102,21 @@ def adaptive_pipeline():
     graph.add_edge("retrieve", "grade_documents")
     graph.add_conditional_edges(
         "grade_documents",
-        grade_documents,
+        grade_router,
         {
             GradeDecision.GENERATE: "generate",
             GradeDecision.REWRITE: "rewrite_query",
         },
     )
-    # Rewrite loops back to retrieval
-    graph.add_edge("rewrite_query", "retrieve")
+    # Rewrite: loop back or give up
+    graph.add_conditional_edges(
+        "rewrite_query",
+        rewrite_router,
+        {
+            "retrieve": "retrieve",
+            "generate": "generate",
+        },
+    )
 
     # Terminal edges
     graph.add_edge("generate", END)
@@ -161,19 +172,27 @@ def self_rag_pipeline():
     graph.add_edge("retrieve", "grade_documents")
     graph.add_conditional_edges(
         "grade_documents",
-        grade_documents,
+        grade_router,
         {
             GradeDecision.GENERATE: "generate",
             GradeDecision.REWRITE: "rewrite_query",
         },
     )
-    graph.add_edge("rewrite_query", "retrieve")
+    # Rewrite: loop back or give up
+    graph.add_conditional_edges(
+        "rewrite_query",
+        rewrite_router,
+        {
+            "retrieve": "retrieve",
+            "generate": "generate",
+        },
+    )
 
     # Generation → Verification chain
     graph.add_edge("generate", "check_hallucination")
     graph.add_conditional_edges(
         "check_hallucination",
-        check_hallucination,
+        hallucination_router,
         {
             "check_quality": "check_answer_quality",
             GradeDecision.REWRITE: "rewrite_query",
@@ -181,7 +200,7 @@ def self_rag_pipeline():
     )
     graph.add_conditional_edges(
         "check_answer_quality",
-        check_answer_quality,
+        quality_router,
         {
             QualityCheckDecision.FINISH: END,
             QualityCheckDecision.REWRITE: "rewrite_query",

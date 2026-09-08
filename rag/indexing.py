@@ -21,7 +21,7 @@ from rag.enums import VectorDBType
 logger = logging.getLogger(__name__)
 
 # File extensions that the loader supports
-SUPPORTED_EXTENSIONS: set[str] = {".pdf", ".md", ".txt", ".html", ".docx", ".csv"}
+SUPPORTED_EXTENSIONS: set[str] = {".pdf", ".md", ".txt", ".html", ".docx", ".csv", ".xlsx", ".xls"}
 
 
 def load_documents(input_dir: Path) -> list[Document]:
@@ -106,6 +106,20 @@ def load_document(file_path: Path) -> Optional[list[Document]]:
             doc.metadata["type"] = "csv"
             doc.metadata["source"] = str(file_path)
         return docs
+    
+
+    elif suffix in (".xlsx", ".xls"):
+        import pandas as pd
+
+        df = pd.read_excel(file_path)
+        docs = []
+        for _, row in df.iterrows():
+            content = "\n".join(f"{col}: {val}" for col, val in row.items() if pd.notna(val))
+            docs.append(Document(
+                page_content=content,
+                metadata={"source": str(file_path), "type": suffix[1:], "sheet": "default"},
+            ))
+        return docs
 
     elif suffix == ".html":
         from langchain_community.document_loaders import BSHTMLLoader
@@ -161,12 +175,13 @@ def get_vectorstore(collection_name: Optional[str] = None):
         )
 
     elif settings.vector_db_type == VectorDBType.PGVECTOR:
-        from langchain_postgres import PostgreSQLVectorStore
+        from langchain_postgres import PGVector
 
-        return PostgreSQLVectorStore(
-            dsn=settings.postgres_dsn,
-            embedding=embeddings,
-            table_name=collection_name,
+        return PGVector(
+            embeddings=embeddings,
+            connection=settings.postgres_dsn,
+            collection_name=collection_name,
+            create_extension=True,
         )
 
     else:  # Chroma (default, local)

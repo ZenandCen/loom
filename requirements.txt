@@ -24,9 +24,13 @@ chromadb
 pypdf
 python-docx
 beautifulsoup4
+pandas
+openpyxl
+xlrd
 # Optional: additional vector backends
 langchain-qdrant
 langchain-postgres
+psycopg2-binary
 # Optional: reranking
 cohere
 # Optional: evaluation

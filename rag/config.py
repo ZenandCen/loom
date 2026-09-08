@@ -38,7 +38,7 @@ class RAGSettings:
     # --- Vector DB ---
     # Persistence directory for Chroma (default backend)
     chroma_persist_dir: str = field(
-        default_factory=lambda: os.getenv("RAG_CHROMA_DIR", "./chroma_data")
+        default_factory=lambda: os.getenv("RAG_CHROMA_DIR", "")
     )
     # Qdrant connection (set to enable Qdrant backend)
     qdrant_url: str = field(default_factory=lambda: os.getenv("RAG_QDRANT_URL", ""))
