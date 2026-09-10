@@ -100,7 +100,7 @@ def pattern_1_llm_chain(llm):
         return result.content, time.time() - start
 
     content, elapsed = run()
-    print(f"\n  🤖 Output: {content[:200]}...")
+    print(f"\n  🤖 Output: {content[:10000]}...")
     print(f"  ⏱️  {elapsed:.2f}s (1 lần gọi LLM)")
     results.append(("1. LLM Chain", elapsed, "PASS"))
 
@@ -155,7 +155,7 @@ def pattern_2_rag(llm):
         return result.content, time.time() - start
 
     content, elapsed = run()
-    print(f"\n  🤖 Output: {content[:200]}...")
+    print(f"\n  🤖 Output: {content[:10000]}...")
     print(f"  ⏱️  {elapsed:.2f}s (1 lần retrieve + 1 lần LLM)")
     results.append(("2. RAG Chain", elapsed, "PASS"))
 
@@ -217,7 +217,7 @@ def pattern_3_agent(llm):
         return messages[-1].content, time.time() - start
 
     content, elapsed = run()
-    print(f"\n  🤖 Output: {content[:200]}")
+    print(f"\n  🤖 Output: {content[:10000]}")
     print(f"  ⏱️  {elapsed:.2f}s (multiple LLM calls for tool loop)")
     results.append(("3. ReAct Agent", elapsed, "PASS"))
 
@@ -276,7 +276,7 @@ def pattern_4_sequential(llm):
         return final.content, time.time() - start
 
     content, elapsed = run()
-    print(f"\n  🤖 Output: {content[:200]}")
+    print(f"\n  🤖 Output: {content}")
     print(f"  ⏱️  {elapsed:.2f}s (3 lần LLM)")
     results.append(("4. Sequential", elapsed, "PASS"))
 
@@ -386,6 +386,7 @@ def pattern_6_routing(llm):
             "billing": lambda q: f"[BILLING] Forwarding to finance team... (query: {q})",
             "complaint": lambda q: f"[COMPLAINT] Escalating to manager... (query: {q})",
         }
+        
         handler = handlers.get(category, handlers["complaint"])
         result = handler("My invoice is wrong, I was charged twice")
         return f"Category: {category}\nResult: {result}", time.time() - start
@@ -1320,21 +1321,21 @@ def main():
     llm = get_llm(LLM.OPENAI)
 
     # Run all patterns
-    pattern_1_llm_chain(llm)
-    pattern_2_rag(llm)
-    pattern_3_agent(llm)
-    pattern_4_sequential(llm)
-    pattern_5_map_reduce(llm)
-    pattern_6_routing(llm)
-    pattern_7_self_refine(llm)
-    pattern_8_langgraph_sequential(llm)
-    pattern_9_langgraph_conditional(llm)
-    pattern_10_langgraph_cyclic(llm)
-    pattern_11_langgraph_parallel(llm)
-    pattern_12_multi_agent(llm)
-    pattern_13_human_in_loop(llm)
-    pattern_14_langgraph_memory(llm)
-    pattern_15_plan_and_execute(llm)
+    # pattern_1_llm_chain(llm)
+    # pattern_2_rag(llm)
+    # pattern_3_agent(llm)
+    # pattern_4_sequential(llm)
+    # pattern_5_map_reduce(llm)
+    # pattern_6_routing(llm)
+    # pattern_7_self_refine(llm)
+    # pattern_8_langgraph_sequential(llm)
+    # pattern_9_langgraph_conditional(llm)
+    # pattern_10_langgraph_cyclic(llm)
+    # pattern_11_langgraph_parallel(llm)
+    # pattern_12_multi_agent(llm)
+    # pattern_13_human_in_loop(llm)
+    # pattern_14_langgraph_memory(llm)
+    # pattern_15_plan_and_execute(llm)
     pattern_16_ensemble(llm)
     pattern_17_subgraph(llm)
 

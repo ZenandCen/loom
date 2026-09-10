@@ -51,8 +51,13 @@ def load_documents(input_dir: Path) -> list[Document]:
         try:
             docs = load_document(file_path)
             if docs:
-                documents.extend(docs)
-                logger.info(f"Loaded: {file_path.name} ({len(docs)} units, {sum(len(d.page_content) for d in docs)} chars)")
+                # Filter out empty documents (e.g., scanned PDFs, empty rows)
+                docs = [d for d in docs if d.page_content.strip()]
+                if docs:
+                    documents.extend(docs)
+                    logger.info(f"Loaded: {file_path.name} ({len(docs)} units, {sum(len(d.page_content) for d in docs)} chars)")
+                else:
+                    logger.warning(f"Skipped (empty content): {file_path.name}")
         except Exception as e:
             logger.error(f"Failed to load {file_path}: {e}")
 
@@ -87,6 +92,10 @@ def load_document(file_path: Path) -> Optional[list[Document]]:
 
         docs = PyPDFLoader(str(file_path)).load()
         # PyPDFLoader preserves page number in metadata — keep it for citations
+        docs = [d for d in docs if d.page_content.strip()]
+        if not docs:
+            logger.warning(f"PDF has no extractable text (scanned image?): {file_path.name}")
+            return None
         for doc in docs:
             doc.metadata["type"] = "pdf"
             doc.metadata["source"] = str(file_path)

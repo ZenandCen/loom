@@ -787,7 +787,7 @@ prompt = (
 )
 response = llm.invoke(prompt)
 print(f"  Q: What is this project about?")
-print(f"  A: {response.content[:200]}")
+print(f"  A: {response.content[:10000]}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 6: FULL AGENT — Everything together
@@ -869,12 +869,16 @@ print(f"\n  6b. Quick RAG query via tool:")
 print("  " + "-" * 50)
 
 from rag.pipeline import run_rag
+from rag.enums import PipelineLevel
 
-result = run_rag("What is this project about?", level=None)
+# Use BASIC pipeline (retrieve → generate) for demo clarity.
+# ADAPTIVE adds grading + rewrite which can loop when vector store
+# has mixed content types (schema tables + prose docs).
+result = run_rag("What is this project about?", level=PipelineLevel.BASIC)
 print(f"  Q: What is this project about?")
-print(f"  A: {result['generation'][:200]}")
+print(f"  A: {result['generation'][:300]}")
 if result['sources']:
-    print(f"  Sources: {result['sources'][:2]}")
+    print(f"  Sources: {result['sources'][:3]}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
