@@ -157,3 +157,60 @@ class LLMUsageTracker:
 
 # Global singleton
 usage_tracker = LLMUsageTracker()
+
+
+# ============================================================
+# Standalone: python -m utils.llm_usage
+# ============================================================
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    # Ensure project root is in path
+    project_root = Path(__file__).resolve().parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
+    from utils.models import LLM, get_llm
+
+    print("\n" + "=" * 60)
+    print("  LLM USAGE CHECK — all models")
+    print("=" * 60)
+
+    llms = [
+        (LLM.OPENAI, "LLM1 (OpenAI)"),
+        (LLM.GEMINI, "LLM2 (Gemini)"),
+        (LLM.OLLAMA, "LLM3 (Ollama)"),
+        (LLM.FALLBACK, "LLM4 (Fallback)"),
+    ]
+
+    for llm_enum, label in llms:
+        try:
+            llm = get_llm(llm_enum)
+            if llm is None:
+                usage_tracker.record_call(llm_enum.value, success=False, error="Not installed")
+                print(f"  ✗ {label}: not installed")
+                continue
+
+            start = time.time()
+            resp = llm.invoke("Say 'ok'")
+            elapsed = (time.time() - start) * 1000
+
+            content = resp.content
+            if isinstance(content, list):
+                content = "".join(
+                    p if isinstance(p, str) else p.get("text", "") for p in content
+                )
+
+            model = getattr(llm, "model_name", None) or getattr(llm, "model", "unknown")
+            usage_tracker.record_call(llm_enum.value, success=True, latency_ms=elapsed)
+            print(f"  ✓ {label}: '{model}' ({elapsed:.0f}ms)")
+
+        except Exception as e:
+            usage_tracker.record_call(llm_enum.value, success=False, error=str(e))
+            print(f"  ✗ {label}: {str(e)[:80]}")
+
+    print()
+    print(usage_tracker.report())
+    print()

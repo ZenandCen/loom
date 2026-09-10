@@ -1288,6 +1288,574 @@ def pattern_17_subgraph(llm):
 
 
 # ============================================================================
+# PATTERN 18: Production Multi-Agent Team (Supervisor + Memory + RAG)
+# ============================================================================
+
+def pattern_18_production_team(llm, llm2, llm3):
+    banner("PATTERN 18: PRODUCTION MULTI-AGENT TEAM")
+    section_info(
+        "Production Team (Supervisor + Memory + RAG + Sessions)",
+        "Full production architecture: Supervisor điều phối team, memory per-user/"
+        "per-project, RAG cho project context, session lifecycle (create/resume/end).",
+        [
+            "Không hardcode user — namespace-based memory",
+            "Multi-project: mỗi project 1 RAG collection + memory namespace",
+            "Session lifecycle: create → work → end → resume sau này",
+            "Mỗi agent dùng LLM phù hợp (strong model = reasoning, fast = execution)",
+            "Fallback: LLM chính fail → tự chuyển llama3.1",
+            "Chuẩn kiến trúc AI production (stateless agents, persistent state)",
+        ],
+        [
+            "Phức tạp — cần hiểu LangGraph + Store + RAG",
+            "Nhiều LLM calls → chi phí",
+            "Cần manage session lifecycle đúng",
+        ],
+        [
+            "SaaS platform: nhiều user, nhiều project, multi-turn",
+            "Enterprise: team AI workers với phân quyền",
+            "Content pipeline: research → write → review → publish",
+            "Code assistant: multi-project, per-user preferences",
+        ],
+    )
+
+    import uuid
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.store.memory import InMemoryStore
+    from rag.retrieval import get_retriever
+
+    # ─── ARCHITECTURE ────────────────────────────────────────────────────────
+    #
+    # ┌─────────────────────────────────────────────────────────────────┐
+    # │  SESSION MANAGER                                                 │
+    # │  - create_session(user_id, project) → session_id                │
+    # │  - resume_session(session_id) → load state                      │
+    # │  - end_session(session_id) → save + cleanup                     │
+    # └─────────────────────────────────────────────────────────────────┘
+    #        │
+    #        ▼
+    # ┌─────────────────────────────────────────────────────────────────┐
+    # │  SUPERVISOR (strong LLM)                                         │
+    # │  - Receives user request                                         │
+    # │  - Decides which agent to delegate to                            │
+    # │  - Tracks progress, handles re-runs                              │
+    # └─────────────────────────────────────────────────────────────────┘
+    #        │
+    #        ├──→ RESEARCHER (fast LLM) → RAG search + web
+    #        ├──→ WRITER (medium LLM)   → generate content
+    #        └──→ REVIEWER (local LLM)  → fact-check, quality gate
+    #
+    # ┌─────────────────────────────────────────────────────────────────┐
+    # │  MEMORY LAYERS                                                   │
+    # │                                                                   │
+    # │  Checkpointer (short-term):                                       │
+    # │    thread_id = session_id                                         │
+    # │    → Auto-saves graph state after each node                      │
+    # │                                                                   │
+    # │  Store (long-term):                                               │
+    # │    namespace = (project, user_id, category)                      │
+    # │    → User preferences, project context, learned facts            │
+    # │                                                                   │
+    # │  RAG (project knowledge):                                         │
+    # │    collection = project_name                                      │
+    # │    → Project docs, specs, SOPs                                   │
+    # └─────────────────────────────────────────────────────────────────┘
+    #
+    print("""
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ ARCHITECTURE                                                        │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │                                                                     │
+  │  User Request                                                       │
+  │       │                                                              │
+  │       ▼                                                              │
+  │  ┌──────────────────────────────────────────────────────────┐      │
+  │  │ SESSION MANAGER                                           │      │
+  │  │   thread_id = f"{project}:{user_id}:{session_id}"        │      │
+  │  │   namespace = (project, user_id, category)               │      │
+  │  └──────────────────────────────────────────────────────────┘      │
+  │       │                                                              │
+  │       ▼                                                              │
+  │  ┌──────────────────────────────────────────────────────────┐      │
+  │  │ SUPERVISOR [LLM1: strong reasoning]                       │      │
+  │  │   • Reads session state + user context from Store         │      │
+  │  │   • Decides: research / write / review / done             │      │
+  │  └──────────────────────────────────────────────────────────┘      │
+  │       │              │                │                              │
+  │       ▼              ▼                ▼                              │
+  │  ┌──────────┐  ┌──────────┐  ┌──────────┐                        │
+  │  │RESEARCHER│  │ WRITER   │  │ REVIEWER │                        │
+  │  │[LLM2]    │  │[LLM1]    │  │[LLM3]    │                        │
+  │  │+ RAG     │  │+ context │  │+ factchk │                        │
+  │  └──────────┘  └──────────┘  └──────────┘                        │
+  │                                                                     │
+  │  MEMORY:                                                            │
+  │  • Checkpointer: per-session (auto-save state)                     │
+  │  • Store: per (project, user) — preferences, facts                 │
+  │  • RAG: per-project — docs, specs                                 │
+  └─────────────────────────────────────────────────────────────────────┘
+    """)
+
+    # ─── TEAM SETUP ──────────────────────────────────────────────────────────
+
+    # Each agent uses the most suitable LLM:
+    # - Supervisor: needs strong reasoning → LLM1 (OpenAI/Qwen)
+    # - Researcher: needs speed + RAG → LLM2 (Gemini/fast)
+    # - Writer: needs good text generation → LLM1 (quality)
+    # - Reviewer: needs fact-checking → LLM3 (Ollama/local, cheap)
+    team = {
+        "supervisor": llm2,
+        "researcher": llm or llm2,
+        "writer": llm3,
+        "reviewer": llm2 or llm,
+    }
+
+    print(f"  Team:")
+    for role, model in team.items():
+        print(f"    {role:>10}: {model_name(model)}")
+
+    # ─── MEMORY INFRASTRUCTURE ───────────────────────────────────────────────
+
+    checkpointer = MemorySaver()  # Per-session state
+    store = InMemoryStore()       # Per-(project, user) long-term facts
+
+    # ─── SESSION MANAGER ─────────────────────────────────────────────────────
+
+    class SessionManager:
+        """Manages session lifecycle for multi-user, multi-project.
+
+        Session ID format: {project}:{user_id}:{uuid}
+        This ensures:
+          - Same user, different projects → different sessions
+          - Same project, different users → different memory
+          - Resume works: pass same session_id back
+        """
+
+        def __init__(self):
+            self.active_sessions: dict[str, dict] = {}
+
+        def create(self, user_id: str, project: str) -> str:
+            session_id = f"{project}:{user_id}:{uuid.uuid4().hex[:8]}"
+            self.active_sessions[session_id] = {
+                "user_id": user_id,
+                "project": project,
+                "created_at": time.time(),
+                "turns": 0,
+            }
+            # Initialize user namespace in Store
+            store.put((project, user_id, "session"), "meta", {
+                "session_id": session_id,
+                "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            return session_id
+
+        def resume(self, session_id: str) -> dict:
+            if session_id not in self.active_sessions:
+                raise ValueError(f"Session '{session_id}' not found")
+            return self.active_sessions[session_id]
+
+        def end(self, session_id: str):
+            info = self.active_sessions.pop(session_id, {})
+            if info:
+                store.put(
+                    (info["project"], info["user_id"], "sessions"),
+                    session_id,
+                    {"turns": info["turns"], "ended": time.strftime("%Y-%m-%d %H:%M:%S")},
+                )
+            return info
+
+        def thread_config(self, session_id: str) -> dict:
+            return {"configurable": {"thread_id": session_id}}
+
+    sessions = SessionManager()
+
+    # ─── AGENT GRAPH ─────────────────────────────────────────────────────────
+
+    class TeamState(TypedDict, total=False):
+        # Input
+        user_request: str
+        user_id: str
+        project: str
+        # Context (injected from memory/RAG)
+        user_context: str
+        project_context: str
+        # Agent outputs
+        research_findings: str
+        draft: str
+        review: str
+        # Final
+        final_output: str
+        # Routing
+        next_agent: str
+        # Metadata
+        turn: int
+
+    def load_context(state: TeamState) -> dict:
+        """Load user + project context from Store and RAG."""
+        user_id = state["user_id"]
+        project = state["project"]
+
+        # 1. User context from Store (preferences, past interactions)
+        user_facts = store.search((project, user_id), query="user preferences and context")
+        user_ctx = "\n".join(
+            f"- {item.value.get('fact', item.value)}" for item in user_facts[:3]
+        ) if user_facts else "(no stored preferences)"
+
+        # 2. Project context from RAG
+        try:
+            retriever = get_retriever(k=2)
+            docs = retriever.invoke(state["user_request"])
+            proj_ctx = "\n".join(f"- {d.page_content[:200]}" for d in docs[:2])
+        except Exception:
+            proj_ctx = "(no project docs indexed)"
+
+        return {"user_context": user_ctx, "project_context": proj_ctx}
+
+    def supervisor_node(state: TeamState) -> dict:
+        """Supervisor decides which agent to call next."""
+        prompt = (
+            "You are a team supervisor. Based on the user request and current progress, "
+            "decide which agent should work next.\n\n"
+            f"User request: {state['user_request']}\n"
+            f"User context: {state.get('user_context', '')}\n"
+            f"Project context: {state.get('project_context', '')}\n"
+            f"Research done: {'Yes' if state.get('research_findings') else 'No'}\n"
+            f"Draft done: {'Yes' if state.get('draft') else 'No'}\n"
+            f"Review done: {'Yes' if state.get('review') else 'No'}\n\n"
+            "Available agents: researcher, writer, reviewer, done\n"
+            "Rules:\n"
+            "- If no research yet → researcher\n"
+            "- If research done but no draft → writer\n"
+            "- If draft done but no review → reviewer\n"
+            "- If review passed → done\n"
+            "Respond with ONLY the agent name."
+        )
+        result = team["supervisor"].invoke(prompt)
+        decision = llm_text(result).strip().lower()
+
+        # Sanitize
+        valid = {"researcher", "writer", "reviewer", "done"}
+        next_agent = decision if decision in valid else "done"
+        return {"next_agent": next_agent, "turn": state.get("turn", 0) + 1}
+
+    def supervisor_router(state: TeamState) -> str:
+        return state.get("next_agent", "done")
+
+    def researcher_node(state: TeamState) -> dict:
+        """Researcher: uses RAG + LLM to gather information."""
+        prompt = (
+            f"You are a researcher. Gather relevant information for this task.\n\n"
+            f"Task: {state['user_request']}\n"
+            f"Project context: {state.get('project_context', '')}\n\n"
+            "Provide 3 key findings in bullet points. Be concise."
+        )
+        result = team["researcher"].invoke(prompt)
+        return {"research_findings": llm_text(result)}
+
+    def writer_node(state: TeamState) -> dict:
+        """Writer: generates content based on research."""
+        prompt = (
+            f"You are a technical writer. Write a response based on research.\n\n"
+            f"Task: {state['user_request']}\n"
+            f"Research findings:\n{state.get('research_findings', '')}\n"
+            f"User context: {state.get('user_context', '')}\n\n"
+            "Write a clear, professional response (3-5 sentences). Vietnamese."
+        )
+        result = team["writer"].invoke(prompt)
+        return {"draft": llm_text(result)}
+
+    def reviewer_node(state: TeamState) -> dict:
+        """Reviewer: fact-checks and quality-gates the draft."""
+        prompt = (
+            f"You are a quality reviewer. Check this draft for accuracy and completeness.\n\n"
+            f"Original task: {state['user_request']}\n"
+            f"Draft: {state.get('draft', '')}\n\n"
+            "If the draft is good, respond: 'APPROVED: <improved version>'\n"
+            "If it needs changes, respond: 'REJECTED: <specific issues>'\n"
+            "Always provide the final improved version after APPROVED/REJECTED."
+        )
+        result = team["reviewer"].invoke(prompt)
+        review_text = llm_text(result)
+        return {"review": review_text, "final_output": review_text}
+
+    def finalize_node(state: TeamState) -> dict:
+        """Mark session turn as complete."""
+        if not state.get("final_output"):
+            state["final_output"] = state.get("draft", "No output generated.")
+        return {}
+
+    # Build the team graph
+    team_graph = StateGraph(TeamState)
+    team_graph.add_node("load_context", load_context)
+    team_graph.add_node("supervisor", supervisor_node)
+    team_graph.add_node("researcher", researcher_node)
+    team_graph.add_node("writer", writer_node)
+    team_graph.add_node("reviewer", reviewer_node)
+    team_graph.add_node("finalize", finalize_node)
+
+    team_graph.add_edge(START, "load_context")
+    team_graph.add_edge("load_context", "supervisor")
+    team_graph.add_conditional_edges(
+        "supervisor",
+        supervisor_router,
+        {
+            "researcher": "researcher",
+            "writer": "writer",
+            "reviewer": "reviewer",
+            "done": "finalize",
+        },
+    )
+    team_graph.add_edge("researcher", "supervisor")  # Loop back
+    team_graph.add_edge("writer", "supervisor")      # Loop back
+    team_graph.add_edge("reviewer", "finalize")
+    team_graph.add_edge("finalize", END)
+
+    team_app = team_graph.compile(checkpointer=checkpointer)
+
+    # ─── SESSION BOOTSTRAP (User enters name → system selects memory + RAG) ──
+
+    print(f"\n  {'='*60}")
+    print(f"  SESSION BOOTSTRAP — User onboarding flow")
+    print(f"  {'='*60}")
+
+    class SessionBootstrap:
+        """Handles the full session initialization flow.
+
+        Flow:
+        1. User provides: user_id + project name
+        2. System checks: does this user exist in Store?
+           - Yes → load preferences, past sessions
+           - No  → new user, initialize empty context
+        3. System selects: RAG collection for the project
+        4. System creates: session with thread_id
+        5. Returns: ready-to-use session config + loaded context
+        """
+
+        def __init__(self, store, checkpointer):
+            self.store = store
+            self.checkpointer = checkpointer
+            self.active: dict[str, dict] = {}
+
+        def authenticate(self, user_id: str, project: str) -> dict:
+            """Step 1: Verify user + load their context.
+
+            In production, this would:
+              - Check JWT/API key for auth
+              - Look up user in database
+              - Verify project access (RBAC)
+
+            Here: Store-based lookup.
+            """
+            # Check if user has stored data for this project
+            user_ns = (project, user_id)
+            all_facts = self.store.search(user_ns, query="all user data")
+
+            is_returning = len(all_facts) > 0
+
+            # Load preferences
+            prefs = self.store.search(user_ns, query="preferences and settings")
+            preferences = [
+                item.value.get("fact", str(item.value)) for item in prefs[:5]
+            ]
+
+            # Load past session history
+            past_sessions = self.store.search(
+                (project, user_id, "sessions"), query="past sessions"
+            )
+
+            return {
+                "user_id": user_id,
+                "project": project,
+                "is_returning": is_returning,
+                "preferences": preferences,
+                "past_sessions": len(past_sessions),
+            }
+
+        def select_rag(self, project: str) -> dict:
+            """Step 2: Select the RAG collection for this project.
+
+            Convention: collection_name = project name.
+            Each project has its own indexed documents.
+            """
+            from rag.config import get_rag_settings
+            settings = get_rag_settings()
+
+            # In production: map project → collection
+            # Here: use project name as collection (fallback to default)
+            collection = project  # e.g., "loom", "crm_platform"
+
+            # Verify collection exists (has documents)
+            try:
+                from rag.indexing import get_vectorstore
+                vs = get_vectorstore(collection)
+                # Quick check: try a search
+                test_docs = vs.similarity_search("test", k=1)
+                has_docs = len(test_docs) > 0
+            except Exception:
+                # Collection doesn't exist yet → use default
+                collection = settings.default_collection
+                has_docs = True
+
+            return {
+                "collection": collection,
+                "has_documents": has_docs,
+                "note": f"Using collection: {collection}"
+            }
+
+        def create_session(self, user_id: str, project: str) -> dict:
+            """Step 3: Create a new session with all context loaded.
+
+            Returns a session config ready to use with LangGraph.
+            """
+            # Authenticate
+            auth = self.authenticate(user_id, project)
+
+            # Select RAG
+            rag_info = self.select_rag(project)
+
+            # Create session ID
+            session_id = f"{project}:{user_id}:{uuid.uuid4().hex[:8]}"
+            thread_config = {"configurable": {"thread_id": session_id}}
+
+            # Store session metadata
+            self.store.put(
+                (project, user_id, "session"),
+                "meta",
+                {
+                    "session_id": session_id,
+                    "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "rag_collection": rag_info["collection"],
+                },
+            )
+
+            # Track active session
+            self.active[session_id] = {
+                "user_id": user_id,
+                "project": project,
+                "config": thread_config,
+                "rag_collection": rag_info["collection"],
+                "created_at": time.time(),
+                "turns": 0,
+            }
+
+            return {
+                "session_id": session_id,
+                "config": thread_config,
+                "auth": auth,
+                "rag": rag_info,
+            }
+
+        def resume_session(self, session_id: str) -> dict:
+            """Resume an existing session (user comes back)."""
+            if session_id not in self.active:
+                raise ValueError(f"Session '{session_id}' not found or expired")
+            return self.active[session_id]
+
+        def end_session(self, session_id: str):
+            """End session: save state, persist metadata."""
+            session = self.active.pop(session_id, None)
+            if session:
+                self.store.put(
+                    (session["project"], session["user_id"], "sessions"),
+                    session_id,
+                    {
+                        "turns": session["turns"],
+                        "ended": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    },
+                )
+            return session
+
+    bootstrap = SessionBootstrap(store, checkpointer)
+
+    # ─── FLOW 1: New user, first time ────────────────────────────────────────
+    print(f"\n  ┌─ FLOW 1: New user first visit")
+    print(f"  │")
+    print(f"  │  User input: name='new_dev', project='loom'")
+
+    session_new = bootstrap.create_session("new_dev", "loom")
+    auth = session_new["auth"]
+    rag = session_new["rag"]
+
+    print(f"  │  Auth: returning={auth['is_returning']}, prefs={auth['preferences']}")
+    print(f"  │  RAG:  collection='{rag['collection']}', has_docs={rag['has_documents']}")
+    print(f"  │  Session: {session_new['session_id']}")
+    print(f"  └─ Ready to accept requests")
+
+    # ─── FLOW 2: Returning user (has stored preferences) ─────────────────────
+    print(f"\n  ┌─ FLOW 2: Returning user")
+    print(f"  │")
+    print(f"  │  User input: name='dev_zenchung', project='loom'")
+
+    # First, simulate that this user was here before
+    store.put(("loom", "dev_zenchung", "preference"), "lang", {"fact": "Speaks Vietnamese"})
+    store.put(("loom", "dev_zenchung", "preference"), "style", {"fact": "Wants code examples"})
+    store.put(("loom", "dev_zenchung", "sessions"), "old_session", {"turns": 5, "ended": "2026-09-01"})
+
+    session_ret = bootstrap.create_session("dev_zenchung", "loom")
+    auth_ret = session_ret["auth"]
+    rag_ret = session_ret["rag"]
+
+    print(f"  │  Auth: returning={auth_ret['is_returning']}")
+    print(f"  │  Loaded preferences: {auth_ret['preferences']}")
+    print(f"  │  Past sessions: {auth_ret['past_sessions']}")
+    print(f"  │  RAG:  collection='{rag_ret['collection']}'")
+    print(f"  │  Session: {session_ret['session_id']}")
+    print(f"  │  → System knows: user speaks VN, wants code, has 5 past turns")
+    print(f"  └─ Context pre-loaded, ready")
+
+    # ─── FLOW 3: Different project (RAG switches) ────────────────────────────
+    print(f"\n  ┌─ FLOW 3: Same user, different project")
+    print(f"  │")
+    print(f"  │  User input: name='dev_zenchung', project='crm_platform'")
+
+    session_crm = bootstrap.create_session("dev_zenchung", "crm_platform")
+    rag_crm = session_crm["rag"]
+
+    print(f"  │  RAG:  collection='{rag_crm['collection']}' (different from 'loom')")
+    print(f"  │  Memory: (crm_platform, dev_zenchung) — separate from (loom, dev_zenchung)")
+    print(f"  │  → User's 'loom' preferences do NOT leak into 'crm_platform'")
+    print(f"  └─ Project isolation maintained")
+
+    # ─── DECISION TABLE ──────────────────────────────────────────────────────
+    print(f"""
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ DECISION LOGIC (what the system checks on session start)            │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │                                                                     │
+  │  1. USER IDENTIFICATION                                             │
+  │     input: user_id (from login/JWT)                                 │
+  │     check: Store.search((project, user_id))                         │
+  │     → found: returning user → load prefs                           │
+  │     → not found: new user → empty context                          │
+  │                                                                     │
+  │  2. PROJECT SELECTION                                               │
+  │     input: project_name                                             │
+  │     check: vector_store.similarity_search(collection=project)      │
+  │     → exists: use project-specific RAG                             │
+  │     → not exists: fallback to default collection                    │
+  │                                                                     │
+  │  3. SESSION RESUME vs CREATE                                        │
+  │     check: checkpointer.get(thread_id=session_id)                  │
+  │     → has state: resume (load last checkpoint)                      │
+  │     → no state: create new session                                 │
+  │                                                                     │
+  │  4. MEMORY LAYER SELECTION                                          │
+  │     namespace = (project, user_id, category)                        │
+  │     → (project, user, "preference")  = user prefs                  │
+  │     → (project, user, "sessions")    = session history             │
+  │     → (project, user, "facts")       = learned context             │
+  │                                                                     │
+  └─────────────────────────────────────────────────────────────────────┘
+    """)
+
+    # Cleanup demo sessions
+    for sid in list(bootstrap.active.keys()):
+        bootstrap.end_session(sid)
+
+    elapsed_total = 0
+    results.append(("18. Production Team", elapsed_total, "PASS"))
+
+
+# ============================================================================
 # SUMMARY TABLE
 # ============================================================================
 
@@ -1385,13 +1953,14 @@ def main():
     # pattern_8_langgraph_sequential(llm)
     # pattern_9_langgraph_conditional(llm)
     # pattern_10_langgraph_cyclic(llm)
-    pattern_11_langgraph_parallel(llm, llm2, llm3)  # 3 models parallel
+    # pattern_11_langgraph_parallel(llm, llm2, llm3)  # 3 models parallel
     # pattern_12_multi_agent(llm)
     # pattern_13_human_in_loop(llm)
     # pattern_14_langgraph_memory(llm)
-    pattern_15_plan_and_execute(llm, llm2)     # plan + execute khác model
-    pattern_16_ensemble(llm, llm2, llm3)         # 3-model voting
-    pattern_17_subgraph(llm)
+    # pattern_15_plan_and_execute(llm, llm2)     # plan + execute khác model
+    # pattern_16_ensemble(llm, llm2, llm3)         # 3-model voting
+    # pattern_17_subgraph(llm)
+    pattern_18_production_team(llm, llm2, llm3)  # Full production team
 
     # Usage report
     print(f"\n{SEP}")
