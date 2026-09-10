@@ -18,7 +18,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
-from utils.models import LLM, get_llm
+from utils.models import LLM, get_llm, get_llm_with_fallback
+from utils.llm_usage import usage_tracker
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,6 +27,19 @@ logger = logging.getLogger(__name__)
 # Separator for section output
 SEP = "=" * 70
 THIN_SEP = "-" * 50
+
+
+def model_name(llm) -> str:
+    """Get model name string (works for both OpenAI and Gemini wrappers)."""
+    return getattr(llm, "model_name", None) or getattr(llm, "model", "unknown")
+
+
+def llm_text(response) -> str:
+    """Safely extract text from LLM response (Gemini may return list of parts)."""
+    raw = response.content
+    if isinstance(raw, list):
+        return "".join(part if isinstance(part, str) else part.get("text", "") for part in raw)
+    return raw
 
 # Collect all results for final summary
 results: list[tuple[str, float, str]] = []
@@ -703,7 +717,7 @@ def pattern_10_langgraph_cyclic(llm):
 # PATTERN 11: LangGraph Parallel (Fan-out / Fan-in)
 # ============================================================================
 
-def pattern_11_langgraph_parallel(llm):
+def pattern_11_langgraph_parallel(llm, llm2=None, llm3=None):
     banner("PATTERN 11: LANGGRAPH PARALLEL (Fan-out / Fan-in)")
     section_info(
         "LangGraph Parallel",
@@ -729,6 +743,10 @@ def pattern_11_langgraph_parallel(llm):
         ],
     )
 
+    # Mỗi branch dùng LLM khác nhau (3 models parallel)
+    llm_branch2 = llm2 or llm
+    llm_branch3 = llm3 or llm2 or llm
+
     def run():
         start = time.time()
 
@@ -741,15 +759,15 @@ def pattern_11_langgraph_parallel(llm):
 
         def technical(state: State) -> dict:
             result = llm.invoke(f"Technical perspective on '{state['topic']}' in 1 sentence (Vietnamese).")
-            return {"technical_view": result.content}
+            return {"technical_view": llm_text(result)}
 
         def business(state: State) -> dict:
-            result = llm.invoke(f"Business perspective on '{state['topic']}' in 1 sentence (Vietnamese).")
-            return {"business_view": result.content}
+            result = llm_branch2.invoke(f"Business perspective on '{state['topic']}' in 1 sentence (Vietnamese).")
+            return {"business_view": llm_text(result)}
 
         def user(state: State) -> dict:
-            result = llm.invoke(f"End-user perspective on '{state['topic']}' in 1 sentence (Vietnamese).")
-            return {"user_view": result.content}
+            result = llm_branch3.invoke(f"End-user perspective on '{state['topic']}' in 1 sentence (Vietnamese).")
+            return {"user_view": llm_text(result)}
 
         def combine(state: State) -> dict:
             result = llm.invoke(
@@ -758,7 +776,7 @@ def pattern_11_langgraph_parallel(llm):
                 f"- Business: {state['business_view']}\n"
                 f"- User: {state['user_view']}"
             )
-            return {"combined": result.content}
+            return {"combined": llm_text(result)}
 
         graph = StateGraph(State)
         graph.add_node("technical", technical)
@@ -796,6 +814,7 @@ def pattern_11_langgraph_parallel(llm):
     content, elapsed = run()
     print(f"\n  🤖 Output:\n    {content}")
     print(f"  ⏱️  {elapsed:.2f}s (3 parallel + 1 combine)")
+    print(f"  📌 Branch1: {model_name(llm)} | Branch2: {model_name(llm_branch2)} | Branch3: {model_name(llm_branch3)}")
     results.append(("11. LangGraph Parallel", elapsed, "PASS"))
 
 
@@ -1042,7 +1061,7 @@ def pattern_14_langgraph_memory(llm):
 # PATTERN 15: Plan-and-Execute
 # ============================================================================
 
-def pattern_15_plan_and_execute(llm):
+def pattern_15_plan_and_execute(llm, llm2=None):
     banner("PATTERN 15: PLAN-AND-EXECUTE")
     section_info(
         "Plan-and-Execute",
@@ -1052,6 +1071,7 @@ def pattern_15_plan_and_execute(llm):
             "Execution rẻ (dùng model nhỏ cho mỗi step)",
             "Plan có thể review/edit trước khi execute",
             "Dễ parallelize các step độc lập",
+            "Tối ưu chi phí: chỉ 1 lần gọi model mạnh",
         ],
         [
             "Plan cứng: không adapt khi execution gặp vấn đề",
@@ -1068,29 +1088,34 @@ def pattern_15_plan_and_execute(llm):
         ],
     )
 
+    # Use llm2 for execution if provided, otherwise use llm
+    executor = llm2 or llm
+
     def run():
         start = time.time()
 
-        # PLAN (strong model)
-        plan = llm.invoke(
+        # PLAN (strong model — llm)
+        plan_resp = llm.invoke(
             "Create a 3-step plan to explain 'REST API' to a beginner.\n"
             "Format: Step 1: ...\\nStep 2: ...\\nStep 3: ...\nVietnamese, 1 line each."
-        ).content
+        )
+        plan = llm_text(plan_resp)
 
-        # EXECUTE (each step)
+        # EXECUTE (each step — llm2, cheaper/different model)
         results_lines = []
         for i, line in enumerate(plan.strip().split("\n"), 1):
-            result = llm.invoke(
+            resp = executor.invoke(
                 f"Execute this step of explaining REST API to a beginner:\n{line}\n"
                 "Write 1-2 sentences. Vietnamese."
-            ).content
-            results_lines.append(result)
+            )
+            results_lines.append(llm_text(resp))
 
-        return f"PLAN:\n{plan}\n\nEXECUTION:\n" + "\n".join(results_lines), time.time() - start
+        return f"PLAN (by {model_name(llm)}):\n{plan}\n\nEXECUTION (by {model_name(executor)}):\n" + "\n".join(results_lines), time.time() - start
 
     content, elapsed = run()
     print(f"\n  🤖 Output:\n    {content}")
     print(f"  ⏱️  {elapsed:.2f}s (1 plan + 3 execute = 4 calls)")
+    print(f"  📌 Planner: {model_name(llm)} | Executor: {model_name(executor)}")
     results.append(("15. Plan-and-Execute", elapsed, "PASS"))
 
 
@@ -1098,16 +1123,18 @@ def pattern_15_plan_and_execute(llm):
 # PATTERN 16: Ensemble / Voting
 # ============================================================================
 
-def pattern_16_ensemble(llm):
+def pattern_16_ensemble(llm, llm2, llm3=None):
     banner("PATTERN 16: ENSEMBLE / VOTING")
     section_info(
         "Ensemble / Voting",
-        "Nhiều LLM (hoặc cùng LLM với temp khác) trả lời → vote/aggregate → final answer.",
+        "Nhiều LLM (khác provider) trả lời → vote/aggregate → final answer.",
         [
             "Giảm hallucination (cần majority agree)",
             "Robust: 1 model sai không ảnh hưởng tất cả",
             "Có confidence score (độ đồng thuận)",
             "Tăng accuracy cho classification",
+            "Multi-provider: không phụ thuộc 1 vendor",
+            "3 voters → majority clear hơn 2",
         ],
         [
             "Rất tốn tiền (N lần gọi LLM)",
@@ -1127,34 +1154,45 @@ def pattern_16_ensemble(llm):
     def run():
         start = time.time()
 
-        # 3 "voters" (same model, different prompts to simulate diversity)
+        # Build voter list: always 2, optionally 3
+        voters = [
+            (f"LLM1 ({model_name(llm)})", llm),
+            (f"LLM2 ({model_name(llm2)})", llm2),
+        ]
+        if llm3:
+            voters.append((f"LLM3 ({model_name(llm3)})", llm3))
+
         questions = [
             "Is the Earth flat? Answer YES or NO only.",
             "Is water wet? Answer YES or NO only.",
             "Can humans fly without assistance? Answer YES or NO only.",
         ]
 
-        votes = []
-        for q in questions:
-            # 3 votes per question
-            q_votes = []
-            for _ in range(3):
-                r = llm.invoke(q)
-                q_votes.append(r.content.strip().upper()[:3])  # YES/NO
-            votes.append(q_votes)
-
-        # Aggregate
         results_text = []
-        for i, (q, v) in enumerate(zip(questions, votes)):
-            yes_count = sum(1 for x in v if x.startswith("YES"))
-            final = "YES" if yes_count > 1 else "NO"
-            results_text.append(f"Q{i+1} ({v}): → {final}")
+        for q in questions:
+            # Each voter (different LLM provider) votes independently
+            q_votes = []
+            for voter_name, voter_llm in voters:
+                r = voter_llm.invoke(q)
+                answer = llm_text(r).strip().upper()[:3]  # YES/NO
+                q_votes.append(f"{voter_name}:{answer}")
+
+            # Aggregate: majority vote
+            yes_count = sum(1 for v in q_votes if ":YES" in v)
+            no_count = sum(1 for v in q_votes if ":NO" in v)
+            final = "YES" if yes_count > no_count else "NO"
+            results_text.append(f"Q: {q}\n  Votes: {', '.join(q_votes)}\n  → {final}\n")
 
         return "\n".join(results_text), time.time() - start
 
     content, elapsed = run()
     print(f"\n  🤖 Output:\n    {content}")
-    print(f"  ⏱️  {elapsed:.2f}s (3 questions × 3 votes = 9 calls)")
+    n_models = 3 if llm3 else 2
+    print(f"  ⏱️  {elapsed:.2f}s (3 questions × {n_models} models = {3*n_models} calls)")
+    if llm3:
+        print(f"  📌 LLM1: {model_name(llm)} | LLM2: {model_name(llm2)} | LLM3: {model_name(llm3)}")
+    else:
+        print(f"  📌 LLM1: {model_name(llm)} | LLM2: {model_name(llm2)}")
     results.append(("16. Ensemble/Voting", elapsed, "PASS"))
 
 
@@ -1318,7 +1356,23 @@ def main():
     print(f"  {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(SEP)
 
-    llm = get_llm(LLM.OPENAI)
+    # ─── LLM SETUP ───────────────────────────────────────────────────────────
+    # 4 LLMs: 3 primary + 1 fallback
+    #   llm   = primary   (auto-fallback to llama3.1 if unavailable)
+    #   llm2  = secondary (auto-fallback)
+    #   llm3  = tertiary  (auto-fallback)
+    #
+    # Nếu LLM chính cạn quota / lỗi → tự chuyển sang FALLBACK (llama3.1:latest)
+    # ─────────────────────────────────────────────────────────────────────────
+    llm = get_llm_with_fallback(LLM.OPENAI)
+    llm2 = get_llm_with_fallback(LLM.GEMINI)
+    llm3 = get_llm_with_fallback(LLM.OLLAMA)
+
+    print(f"\n  LLM 1 (primary):   {model_name(llm)}")
+    print(f"  LLM 2 (secondary): {model_name(llm2)}")
+    print(f"  LLM 3 (tertiary):  {model_name(llm3)}")
+    print(f"  Fallback:          {model_name(get_llm(LLM.FALLBACK))} (auto if above fail)")
+    print()
 
     # Run all patterns
     # pattern_1_llm_chain(llm)
@@ -1331,13 +1385,21 @@ def main():
     # pattern_8_langgraph_sequential(llm)
     # pattern_9_langgraph_conditional(llm)
     # pattern_10_langgraph_cyclic(llm)
-    # pattern_11_langgraph_parallel(llm)
+    pattern_11_langgraph_parallel(llm, llm2, llm3)  # 3 models parallel
     # pattern_12_multi_agent(llm)
     # pattern_13_human_in_loop(llm)
     # pattern_14_langgraph_memory(llm)
-    # pattern_15_plan_and_execute(llm)
-    pattern_16_ensemble(llm)
+    pattern_15_plan_and_execute(llm, llm2)     # plan + execute khác model
+    pattern_16_ensemble(llm, llm2, llm3)         # 3-model voting
     pattern_17_subgraph(llm)
+
+    # Usage report
+    print(f"\n{SEP}")
+    print("  LLM USAGE REPORT")
+    print(SEP)
+    print()
+    print(usage_tracker.report())
+    print()
 
     # Summary
     print_summary()

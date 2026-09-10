@@ -292,23 +292,50 @@ def check_embedding_roundtrip(hc: HealthCheck):
 
 
 def check_llm(hc: HealthCheck):
-    """Verify LLM is reachable (quick test)."""
-    try:
-        from utils.models import LLM, get_llm
+    """Verify all configured LLMs are reachable + show usage stats."""
+    from utils.models import LLM, get_llm
+    from utils.llm_usage import usage_tracker
 
-        llm = get_llm(LLM.OPENAI)
-        start = time.time()
-        response = llm.invoke("Say 'ok'")
-        elapsed = (time.time() - start) * 1000
+    llms_to_check = [
+        (LLM.OPENAI, "LLM1 (OpenAI)"),
+        (LLM.GEMINI, "LLM2 (Gemini)"),
+        (LLM.OLLAMA, "LLM3 (Ollama)"),
+        (LLM.FALLBACK, "LLM4 (Fallback)"),
+    ]
 
-        hc.check(
-            f"LLM: responds ({elapsed:.0f}ms)",
-            bool(response.content.strip()),
-            ""
-        )
+    for llm_enum, label in llms_to_check:
+        try:
+            llm = get_llm(llm_enum)
+            if llm is None:
+                hc.check(f"{label}: available", False, "Package not installed or model is None")
+                continue
 
-    except Exception as e:
-        hc.check("LLM: connectivity", False, str(e))
+            start = time.time()
+            response = llm.invoke("Say 'ok'")
+            elapsed = (time.time() - start) * 1000
+
+            # Handle Gemini returning list content
+            content = response.content
+            if isinstance(content, list):
+                content = "".join(
+                    p if isinstance(p, str) else p.get("text", "") for p in content
+                )
+
+            model = getattr(llm, "model_name", None) or getattr(llm, "model", "unknown")
+            hc.check(
+                f"{label}: '{model}' responds ({elapsed:.0f}ms)",
+                bool(content.strip()),
+                ""
+            )
+            usage_tracker.record_call(llm_enum.value, success=True, latency_ms=elapsed)
+
+        except Exception as e:
+            hc.check(f"{label}: connectivity", False, str(e))
+            usage_tracker.record_call(llm_enum.value, success=False, error=str(e))
+
+    # Print usage report
+    print(f"\n  LLM Usage Report:")
+    print(usage_tracker.report())
 
 
 def main():
