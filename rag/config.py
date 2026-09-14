@@ -83,7 +83,7 @@ class RAGSettings:
     data_dir: Path = field(default_factory=lambda: Path(os.getenv("RAG_DATA_DIR", "./data")))
     # Path to evaluation dataset JSON
     eval_dataset_path: str = field(
-        default_factory=lambda: os.getenv("RAG_EVAL_DATASET", "./data/eval_questions.json")
+        default_factory=lambda: os.getenv("RAG_EVAL_DATASET", "./eval_data/eval_questions.json")
     )
 
     # --- Collection ---

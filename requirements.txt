@@ -36,6 +36,16 @@ cohere
 # Optional: evaluation
 ragas
 
+# API
+fastapi
+uvicorn
+python-multipart
+boto3
+httpx
+
+# MCP
+mcp
+
 # Utils
 python-dotenv
 pydantic

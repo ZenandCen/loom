@@ -1,0 +1,7 @@
+.venv
+.git
+.env
+chroma_data
+__pycache__
+*.pyc
+workspace

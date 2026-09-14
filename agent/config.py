@@ -52,12 +52,18 @@ from utils.models import LLM, get_llm  # noqa: F401
 
 # --- Memory Infrastructure ---
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.store.memory import InMemoryStore
 
-# DEV: in-memory
-# PROD: PostgresSaver + PlatformStore
+# Checkpointer: per-session state (short-term)
 checkpointer = MemorySaver()
-store = InMemoryStore()
+
+# Store: long-term memory per (project, user, category)
+# Use PostgresStore if RAG_PG_DSN is set, fallback to InMemoryStore
+try:
+    from memory.store import PostgresStore
+    store = PostgresStore()
+except Exception:
+    from langgraph.store.memory import InMemoryStore
+    store = InMemoryStore()
 
 # --- Backend (Composite — hybrid storage) ---
 from deepagents.backends import (
@@ -72,13 +78,19 @@ WORKSPACE_DIR.mkdir(exist_ok=True)
 
 
 def build_backend():
-    """Composite backend: scratch → state, workspace → disk, memories → store."""
+    """Composite backend: scratch → state, workspace → disk, memories → store.
+
+    Routes:
+        /            → State (RAM, session-scoped)
+        /workspace/  → Disk (./workspace/ directory, persistent)
+        /memories/   → PostgresStore (per-user namespace, persistent)
+    """
     return CompositeBackend(
         default=StateBackend(),
         routes={
             "/workspace/": FilesystemBackend(root_dir=WORKSPACE_DIR, virtual_mode=True),
             "/memories/": StoreBackend(
-                namespace=lambda rt: ("loom", "filesystem")
+                namespace=lambda rt: ("loom", rt.get("user_id", "default"), "filesystem")
             ),
         },
     )

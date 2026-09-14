@@ -1,0 +1,78 @@
+services:
+  postgres:
+    image: docker.io/pgvector/pgvector:pg17
+    container_name: pg17-server
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "xx!"
+      POSTGRES_DB: loom
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: docker.io/minio/minio:latest
+    container_name: minio-server
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: "xx!123456"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  loom:
+    build: .
+    container_name: loom
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      RAG_PG_DSN: postgresql://postgres:xx!@postgres:5432/loom
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: admin
+      MINIO_SECRET_KEY: xx!123456
+      MINIO_BUCKET: rag-documents
+      MINIO_USE_SSL: "false"
+      API_HOST: 0.0.0.0
+      API_PORT: "8000"
+      RAG_DATA_DIR: /app/data
+      LOOM_CODE_DIR: /projects
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./workspace:/app/workspace
+      - /home/zenchung:/projects
+
+  ngrok:
+    image: docker.io/ngrok/ngrok:latest
+    container_name: loom-ngrok
+    depends_on:
+      - loom
+    environment:
+      NGROK_AUTHTOKEN: "2gu4KsY5mn3VoGKhNKBGeyWbrIP_4fxFuCdERyBwHbkKM7WFb"
+    command: http --url=${NGROK_DOMAIN:-snappiest-unpendulously-kyung.ngrok-free.dev} loom:8000
+    ports:
+      - "4040:4040"
+
+volumes:
+  pgdata:
+  minio-data:
