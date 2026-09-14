@@ -19,7 +19,7 @@ def rag_query(query: str, pipeline_level: str = "adaptive") -> str:
     """Query the knowledge base using RAG (Retrieval-Augmented Generation).
 
     Searches indexed documents and generates a grounded answer with sources.
-    Use this for questions that require information from your local knowledge base.
+    Searches within the active project's collection.
 
     Args:
         query: The question to answer using the knowledge base.
@@ -30,7 +30,9 @@ def rag_query(query: str, pipeline_level: str = "adaptive") -> str:
     except ValueError:
         level = PipelineLevel.ADAPTIVE
 
-    result = run_rag(query, level=level)
+    from agent.tools import get_active_collection
+    collection = get_active_collection()
+    result = run_rag(query, level=level, collection_name=collection)
 
     # Format the response for the agent
     answer = result.get("generation", "No answer generated.")

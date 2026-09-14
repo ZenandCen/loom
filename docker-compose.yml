@@ -55,6 +55,7 @@ services:
       API_PORT: "8000"
       RAG_DATA_DIR: /app/data
       LOOM_CODE_DIR: /projects
+      RAG_OLLAMA_URL: http://host.containers.internal:11434
     ports:
       - "8000:8000"
     volumes:

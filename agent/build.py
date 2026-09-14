@@ -62,4 +62,4 @@ def build_agent(llm: LLM = LLM.OPENAI):
         },
     )
 
-    return agent.with_config({"recursion_limit": 50})
+    return agent.with_config({"recursion_limit": 30})

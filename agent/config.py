@@ -51,10 +51,24 @@ if os.getenv("LANGSMITH_TRACING", "").lower() in ("true", "1", "yes"):
 from utils.models import LLM, get_llm  # noqa: F401
 
 # --- Memory Infrastructure ---
-from langgraph.checkpoint.memory import MemorySaver
-
-# Checkpointer: per-session state (short-term)
-checkpointer = MemorySaver()
+# Checkpointer: per-session state (persistent via Postgres connection pool)
+_pg_dsn = os.getenv("RAG_PG_DSN", "")
+try:
+    if _pg_dsn:
+        from psycopg_pool import ConnectionPool
+        from langgraph.checkpoint.postgres import PostgresSaver
+        _pg_pool = ConnectionPool(_pg_dsn, open=True, min_size=1, max_size=5)
+        checkpointer = PostgresSaver(_pg_pool)
+        checkpointer.setup()
+        print(f"  [CHECKPOINTER] PostgresSaver (pool) ready")
+    else:
+        from langgraph.checkpoint.memory import MemorySaver
+        checkpointer = MemorySaver()
+        print(f"  [CHECKPOINTER] MemorySaver (no PG_DSN)")
+except Exception as e:
+    from langgraph.checkpoint.memory import MemorySaver
+    checkpointer = MemorySaver()
+    print(f"  [CHECKPOINTER] MemorySaver (fallback: {e})")
 
 # Store: long-term memory per (project, user, category)
 # Use PostgresStore if RAG_PG_DSN is set, fallback to InMemoryStore
@@ -77,6 +91,17 @@ WORKSPACE_DIR = project_root / "workspace"
 WORKSPACE_DIR.mkdir(exist_ok=True)
 
 
+def _memories_namespace(rt):
+    """Resolve per-user namespace for StoreBackend."""
+    try:
+        from langgraph.config import get_config
+        config = get_config()
+        user_id = config.get("configurable", {}).get("user_id", "default")
+    except Exception:
+        user_id = "default"
+    return ("loom", user_id, "filesystem")
+
+
 def build_backend():
     """Composite backend: scratch → state, workspace → disk, memories → store.
 
@@ -90,7 +115,7 @@ def build_backend():
         routes={
             "/workspace/": FilesystemBackend(root_dir=WORKSPACE_DIR, virtual_mode=True),
             "/memories/": StoreBackend(
-                namespace=lambda rt: ("loom", rt.get("user_id", "default"), "filesystem")
+                namespace=_memories_namespace
             ),
         },
     )

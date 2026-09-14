@@ -12,6 +12,8 @@ langchain-qwq
 # Agent
 deepagents
 langsmith
+langgraph-checkpoint-postgres
+psycopg_pool
 
 # Tools
 tavily-python

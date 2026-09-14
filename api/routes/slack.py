@@ -110,12 +110,29 @@ async def process_message(
                 except Exception:
                     break
 
+    # Slack thread continuity:
+    # - Root message: thread_ts=None, use event_ts (becomes thread_ts for replies)
+    # - Reply in thread: thread_ts = root message's event_ts (consistent)
+    thread_id = thread_ts or event_ts
+    config = {"configurable": {"user_id": user_id, "thread_id": thread_id}}
+
+    # Command: !reset — clear conversation state for this thread
+    if msg.strip().lower() in ("!reset", "!new", "!clear"):
+        try:
+            from agent.config import checkpointer
+            checkpointer.delete_thread(thread_id)
+            await slack_bot.post_message(
+                channel_id, "Conversation reset. Starting fresh.", thread_ts=thread_ts
+            )
+        except Exception as e:
+            await slack_bot.post_message(
+                channel_id, f"Reset: {e}", thread_ts=thread_ts
+            )
+        return
+
     logger.info(f"AI processing... (User={user_id}, Ch={channel_id})")
     try:
         agent = await get_agent()
-        # Use Slack thread as thread_id for conversation continuity
-        thread_id = thread_ts or f"slack-{channel_id}-{user_id}"
-        config = {"configurable": {"user_id": user_id, "thread_id": thread_id}}
 
         # Middleware only supports sync — run in thread executor
         result = await asyncio.to_thread(
@@ -146,10 +163,16 @@ async def process_message(
 
     except Exception as e:
         logger.error(f"Error processing message: {e}")
-        try:
-            await slack_bot.post_message(
-                channel_id, f"Sorry, I encountered an error: {e}", thread_ts=thread_ts
+        err_msg = str(e)
+        if "recursion limit" in err_msg.lower():
+            reply = (
+                "I got stuck in a loop trying to process that. "
+                "Try rephrasing your request, or send `!reset` to start fresh."
             )
+        else:
+            reply = f"Sorry, I encountered an error: {err_msg[:500]}"
+        try:
+            await slack_bot.post_message(channel_id, reply, thread_ts=thread_ts)
         except Exception:
             pass
 

@@ -28,6 +28,7 @@ class RAGState(TypedDict, total=False):
     """
 
     question: str
+    collection_name: str
     documents: list[Document]
     generation: str
     # Control signals (written by grading/routing nodes)

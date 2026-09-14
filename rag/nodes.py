@@ -84,12 +84,13 @@ def retrieve(state: RAGState) -> dict:
         Partial state update with `documents` and `question`.
     """
     question = state["question"]
+    collection_name = state.get("collection_name")
     settings = get_rag_settings()
 
     # Over-fetch: retrieve 3x more candidates than needed
     # This gives the reranker a larger pool to select from
     overfetch_k = settings.retrieval_k * 3
-    retriever = get_retriever(k=overfetch_k)
+    retriever = get_retriever(collection_name=collection_name, k=overfetch_k)
     docs = retriever.invoke(question)
 
     # Rerank: select the truly most relevant from the larger pool
@@ -112,12 +113,13 @@ def multi_source_retrieve(state: RAGState) -> dict:
         Partial state update with merged `documents`.
     """
     question = state["question"]
+    collection_name = state.get("collection_name")
     settings = get_rag_settings()
     all_docs: list[Document] = []
 
     # Source 1: Vector store
     try:
-        vector_retriever = get_retriever()
+        vector_retriever = get_retriever(collection_name=collection_name)
         all_docs.extend(vector_retriever.invoke(question))
     except Exception as e:
         logger.warning(f"Vector retrieval failed: {e}")

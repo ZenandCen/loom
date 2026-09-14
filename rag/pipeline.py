@@ -290,9 +290,14 @@ def run_rag(
     """
     settings = get_rag_settings()
     level = level or settings.default_pipeline
+    collection_name = collection_name or settings.default_collection
 
     pipeline = get_pipeline(level)
-    result = pipeline.invoke({"question": question, "query_rewrite_count": 0})
+    result = pipeline.invoke({
+        "question": question,
+        "collection_name": collection_name,
+        "query_rewrite_count": 0,
+    })
 
     return {
         "generation": result.get("generation", ""),

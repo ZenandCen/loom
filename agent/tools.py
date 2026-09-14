@@ -29,6 +29,19 @@ def _get_project_dir() -> Path:
     return CODE_BASE_DIR
 
 
+def get_active_collection() -> str:
+    """Derive RAG collection name from the active project.
+
+    e.g. project 'my-ai-project' → collection 'my_ai_project'
+    Falls back to 'rag_kb' if no project is set.
+    """
+    from rag.config import get_rag_settings
+    if _active_project:
+        name = _active_project.name.lower().replace("-", "_").replace(" ", "_")
+        return name
+    return get_rag_settings().default_collection
+
+
 @tool(parse_docstring=True)
 def tavily_search(query: str) -> str:
     """Search the web for information.
@@ -191,6 +204,37 @@ def search_code(pattern: str, path: str = ".") -> str:
 
 
 @tool(parse_docstring=True)
+def reindex_file(path: str, collection: str = "") -> str:
+    """Embed and index a document file into the RAG vector store.
+
+    Args:
+        path: Path to the file (relative to active project)
+        collection: Override collection name (default: active project's collection)
+    """
+    project_dir = _get_project_dir()
+    file_path = (project_dir / path).resolve()
+    if not file_path.exists():
+        file_path = (CODE_BASE_DIR / path).resolve()
+    if not file_path.exists():
+        return f"Error: File '{path}' not found."
+
+    from rag.indexing import load_document, get_vectorstore
+    from rag.chunking import ChunkingConfig, chunk_documents
+
+    collection = collection or get_active_collection()
+    try:
+        docs = load_document(file_path)
+        if not docs:
+            return f"Error: Cannot extract content from '{path}' (unsupported or empty)."
+        chunks = chunk_documents(docs, ChunkingConfig())
+        vs = get_vectorstore(collection)
+        vs.add_documents(chunks)
+        return f"Indexed '{file_path.name}' → {len(chunks)} chunks in '{collection}'."
+    except Exception as e:
+        return f"Reindex failed: {e}"
+
+
+@tool(parse_docstring=True)
 def list_projects() -> str:
     """List all available projects in the code base directory.
 
@@ -212,6 +256,109 @@ def list_projects() -> str:
     return f"Code base: {CODE_BASE_DIR}\n\n" + ("\n".join(entries) if entries else "(no projects found)")
 
 
+@tool(parse_docstring=True)
+def query_database(sql: str) -> str:
+    """Run a SQL query against the project's PostgreSQL database.
+
+    Only SELECT queries are allowed. Returns results as a formatted table.
+
+    Args:
+        sql: SQL query to execute (SELECT only)
+    """
+    import re as _re
+
+    # Safety: only allow SELECT
+    stripped = sql.strip().upper()
+    if not stripped.startswith("SELECT") and not stripped.startswith("WITH"):
+        return "Error: Only SELECT queries are allowed."
+    # Block dangerous keywords
+    dangerous = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE", "GRANT", "REVOKE"]
+    for kw in dangerous:
+        if _re.search(rf"\b{kw}\b", stripped):
+            return f"Error: '{kw}' is not allowed. Only SELECT queries."
+
+    from agent.config import _pg_dsn
+    if not _pg_dsn:
+        return "Error: No database connection configured (RAG_PG_DSN not set)."
+
+    import psycopg
+
+    try:
+        conn = psycopg.connect(_pg_dsn, autocommit=True)
+        cur = conn.cursor()
+        cur.execute(sql)
+        rows = cur.fetchall()
+        cols = [desc[0] for desc in cur.description] if cur.description else []
+        conn.close()
+
+        if not rows:
+            return "Query returned 0 rows."
+
+        # Format as table
+        max_widths = [len(c) for c in cols]
+        str_rows = []
+        for row in rows[:50]:  # limit to 50 rows
+            str_row = [str(v) if v is not None else "NULL" for v in row]
+            str_rows.append(str_row)
+            for i, v in enumerate(str_row):
+                max_widths[i] = max(max_widths[i], len(v))
+
+        header = " | ".join(c.ljust(max_widths[i]) for i, c in enumerate(cols))
+        separator = "-+-".join("-" * w for w in max_widths)
+        body = "\n".join(" | ".join(v.ljust(max_widths[i]) for i, v in enumerate(r)) for r in str_rows)
+
+        result = f"{header}\n{separator}\n{body}"
+        if len(rows) > 50:
+            result += f"\n... ({len(rows) - 50} more rows)"
+        return result
+
+    except Exception as e:
+        return f"Query error: {e}"
+
+
+@tool(parse_docstring=True)
+def list_tables() -> str:
+    """List all tables in the project's PostgreSQL database with their columns.
+
+    Returns:
+        List of tables with column names and types.
+    """
+    from agent.config import _pg_dsn
+    if not _pg_dsn:
+        return "Error: No database connection configured."
+
+    import psycopg
+
+    try:
+        conn = psycopg.connect(_pg_dsn, autocommit=True)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT table_name, column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+            ORDER BY table_name, ordinal_position
+        """)
+        rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            return "No tables found in 'public' schema."
+
+        tables: dict[str, list[str]] = {}
+        for table, col, dtype in rows:
+            tables.setdefault(table, []).append(f"  {col} ({dtype})")
+
+        result = []
+        for table, cols in sorted(tables.items()):
+            result.append(f"📋 {table}:")
+            result.extend(cols)
+            result.append("")
+        return "\n".join(result)
+
+    except Exception as e:
+        return f"Error: {e}"
+
+
 # --- Tools list (pass to agent) ---
 all_tools = [
     tavily_search,
@@ -223,5 +370,8 @@ all_tools = [
     read_file,
     list_directory,
     search_code,
+    reindex_file,
+    query_database,
+    list_tables,
     *all_rag_tools,
 ]
