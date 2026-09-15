@@ -11,6 +11,7 @@ Strategies:
 """
 
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -87,22 +88,24 @@ def header_chunk(text: str, config: Optional[ChunkingConfig] = None) -> list[Doc
 
 
 def parent_child_chunk(
-    text: str, config: Optional[ChunkingConfig] = None
-) -> tuple[list[Document], list[Document]]:
+    text: str, config: Optional[ChunkingConfig] = None, source: str = ""
+) -> tuple[list[Document], list[dict]]:
     """Two-level hierarchical chunking.
 
     Creates small children (good for precise retrieval/embedding)
     and large parents (good for providing full context to LLM).
-    Each child references its parent via `parent_id` metadata.
+    Each child references its parent via `parent_id` metadata (UUID string).
 
     Args:
         text: Raw document text.
         config: Chunking parameters.
+        source: Source file path (stored in parent record).
 
     Returns:
-        Tuple of (children, parents):
-            - children: Index these in the vector store
-            - parents: Return these to the LLM for full context
+        Tuple of (children, parent_records):
+            - children: Index these in the vector store (parent_id = UUID string)
+            - parent_records: List of dicts {"id": uuid_str, "content": str, "source": str}
+              to be stored in the rag_parents table
     """
     config = config or ChunkingConfig()
 
@@ -112,23 +115,28 @@ def parent_child_chunk(
         chunk_overlap=config.chunk_overlap,
     )
 
-    parents = parent_splitter.split_text(text)
+    parent_texts = parent_splitter.split_text(text)
     children: list[Document] = []
+    parent_records: list[dict] = []
 
-    for i, parent in enumerate(parents):
-        child_chunks = child_splitter.split_text(parent)
+    for i, parent_text in enumerate(parent_texts):
+        parent_id = str(uuid.uuid4())
+        parent_records.append({
+            "id": parent_id,
+            "content": parent_text,
+            "source": source,
+        })
+        child_chunks = child_splitter.split_text(parent_text)
         for j, child in enumerate(child_chunks):
-            child_id = f"parent_{i}_child_{j}"
             children.append(
-                Document(page_content=child, metadata={"id": child_id, "parent_id": i})
+                Document(
+                    page_content=child,
+                    metadata={"id": f"{parent_id}_c{j}", "parent_id": parent_id},
+                )
             )
 
-    parent_docs = [
-        Document(page_content=p, metadata={"id": i}) for i, p in enumerate(parents)
-    ]
-
-    logger.debug(f"Parent-child: {len(parents)} parents, {len(children)} children")
-    return children, parent_docs
+    logger.debug(f"Parent-child: {len(parent_records)} parents, {len(children)} children")
+    return children, parent_records
 
 
 def contextual_chunk(
@@ -202,13 +210,39 @@ def chunk_documents(
     Returns:
         Flattened list of chunked Documents with source metadata preserved.
     """
+    chunks, _ = chunk_documents_with_parents(documents, config, llm=llm)
+    return chunks
+
+
+def chunk_documents_with_parents(
+    documents: list[Document],
+    config: Optional[ChunkingConfig] = None,
+    llm=None,
+) -> tuple[list[Document], list[dict]]:
+    """Apply chunking and return both chunks and parent records.
+
+    Same as chunk_documents() but also returns parent records for
+    parent_child strategy (to be stored in rag_parents table).
+
+    Args:
+        documents: Input documents to chunk.
+        config: Chunking strategy and parameters.
+        llm: Required only for CONTEXTUAL strategy.
+
+    Returns:
+        Tuple of (chunks, parent_records):
+            - chunks: Flattened list of chunked Documents
+            - parent_records: List of dicts for rag_parents (empty if not parent_child)
+    """
     config = config or ChunkingConfig()
     all_chunks: list[Document] = []
-    skipped = 0  # count of docs kept whole (fast-path)
+    all_parents: list[dict] = []
+    skipped = 0
 
     for doc in documents:
+        source = doc.metadata.get("source", "")
+
         # Fast-path: unit already fits within chunk_size → no need to split
-        # This preserves per-page coherence for PDFs and per-row for CSVs
         if len(doc.page_content) <= config.chunk_size:
             all_chunks.append(Document(page_content=doc.page_content, metadata=doc.metadata))
             skipped += 1
@@ -221,10 +255,11 @@ def chunk_documents(
             all_chunks.extend(chunks)
 
         elif config.strategy == ChunkingStrategy.PARENT_CHILD:
-            children, _ = parent_child_chunk(doc.page_content, config)
+            children, parent_records = parent_child_chunk(doc.page_content, config, source=source)
             for child in children:
                 child.metadata.update(doc.metadata)
             all_chunks.extend(children)
+            all_parents.extend(parent_records)
 
         elif config.strategy == ChunkingStrategy.CONTEXTUAL and llm is not None:
             chunks = contextual_chunk(doc.page_content, llm, config)
@@ -241,6 +276,6 @@ def chunk_documents(
 
     logger.info(
         f"Chunked {len(documents)} docs → {len(all_chunks)} chunks "
-        f"({config.strategy}, {skipped} kept whole)"
+        f"({config.strategy}, {skipped} kept whole, {len(all_parents)} parents)"
     )
-    return all_chunks
+    return all_chunks, all_parents

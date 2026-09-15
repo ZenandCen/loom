@@ -137,6 +137,15 @@ def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
     if not file_path.is_file():
         return f"Error: '{path}' is not a file."
     try:
+        # Detect binary files (xlsx, docx, pdf, etc.)
+        suffix = file_path.suffix.lower()
+        binary_exts = {".xlsx", ".xls", ".docx", ".pdf", ".pptx", ".zip", ".tar", ".gz", ".png", ".jpg", ".jpeg", ".gif", ".woff", ".woff2", ".ttf", ".exe", ".dll", ".so", ".pyc"}
+        if suffix in binary_exts:
+            return (
+                f"Cannot read binary file '{file_path.name}' as text.\n"
+                f"Use `reindex_folder` to index this file into RAG, then `rag_query` to ask questions about it.\n"
+                f"Example: reindex_folder('.') then rag_query('what tables are listed?')"
+            )
         lines = file_path.read_text(encoding="utf-8").splitlines(keepends=True)
         total = len(lines)
         s = max(start_line - 1, 0) if start_line > 0 else 0
@@ -145,6 +154,11 @@ def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
         content = "".join(chunk)
         header = f"[{file_path.name}: lines {s+1}-{e} of {total}]\n"
         return header + content
+    except UnicodeDecodeError:
+        return (
+            f"Cannot read '{file_path.name}' as text (binary/encoded file).\n"
+            f"Use `reindex_folder` to index this file into RAG, then `rag_query` to ask questions about it."
+        )
     except Exception as e:
         return f"Error reading file: {e}"
 
@@ -292,6 +306,46 @@ def read_folder(path: str = ".", max_lines_per_file: int = 200, overlap: int = 2
     if len(output) > 80000:
         output = output[:80000] + f"\n\n[OUTPUT LIMIT: {len(output)}+ chars. {len(files)} files total. Read specific files individually for full content.]"
     return f"📂 {path}/ — {len(files)} files (parallel read, overlap={overlap}):\n\n{output}"
+
+
+@tool(parse_docstring=True)
+def check_indexed(path: str, collection: str = "") -> str:
+    """Check if a file or folder has been indexed into the RAG vector store.
+
+    Returns the number of chunks found for the given path in the vector store.
+    Use this BEFORE deciding whether to index or query.
+
+    Args:
+        path: File or folder path to check (relative to active project)
+        collection: Override collection name (default: active project's collection)
+    """
+    project_dir = _get_project_dir()
+    check_path = (project_dir / path).resolve() if not Path(path).is_absolute() else Path(path).resolve()
+
+    collection = collection or get_active_collection()
+    try:
+        from rag.indexing import get_vectorstore
+        vs = get_vectorstore(collection)
+
+        # Search for documents with matching source metadata
+        # Use a broad query to see if ANY chunks from this path exist
+        results = vs.similarity_search_with_relevance_scores("document", k=50)
+        if not results:
+            return f"Not indexed: No chunks found in '{collection}' for '{path}'. You should use `reindex_folder` or `reindex_file` first."
+
+        # Filter results that match our path
+        matched_sources = set()
+        for doc, score in results:
+            source = doc.metadata.get("source", "")
+            if str(check_path) in source or path in source:
+                matched_sources.add(source.split("/")[-1])
+
+        if matched_sources:
+            return f"Indexed: Found chunks from {len(matched_sources)} file(s) in '{collection}': {', '.join(sorted(matched_sources)[:10])}. You can use `rag_query` to ask questions."
+        else:
+            return f"Not indexed: No chunks matching '{path}' in '{collection}'. You should use `reindex_folder` or `reindex_file` first."
+    except Exception as e:
+        return f"Error checking index: {e}"
 
 
 @tool(parse_docstring=True)
@@ -503,6 +557,7 @@ all_tools = [
     search_code,
     reindex_file,
     reindex_folder,
+    check_indexed,
     query_database,
     list_tables,
     *all_rag_tools,

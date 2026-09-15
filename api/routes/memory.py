@@ -3,6 +3,7 @@
 Handles:
     GET /api/memory?project=loom&user=dev_zenchung&category=preference&query=...
     GET /api/memory/namespaces
+    GET /api/memory/stats
     DELETE /api/memory/{project}/{user}/{category}/{key}
 """
 
@@ -10,6 +11,13 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Query
 
+from api.schemas import (
+    MemoryDeleteResponse,
+    MemoryItem,
+    MemoryQueryResponse,
+    MemoryStatsResponse,
+    NamespaceListResponse,
+)
 from memory.store import PostgresStore
 
 logger = logging.getLogger(__name__)
@@ -29,7 +37,7 @@ def _get_store() -> PostgresStore:
     return _store
 
 
-@router.get("")
+@router.get("", response_model=MemoryQueryResponse)
 def query_memory(
     project: str = Query(..., description="Project name"),
     user: str = Query(..., description="User ID"),
@@ -56,25 +64,25 @@ def query_memory(
     else:
         items = store.search(namespace, limit=limit)
 
-    return {
-        "project": project,
-        "user": user,
-        "category": category,
-        "query": query,
-        "count": len(items),
-        "items": [
-            {
-                "namespace": list(item.namespace),
-                "key": item.key,
-                "value": item.value,
-                "updated_at": item.updated_at,
-            }
+    return MemoryQueryResponse(
+        project=project,
+        user=user,
+        category=category,
+        query=query,
+        count=len(items),
+        items=[
+            MemoryItem(
+                namespace=list(item.namespace),
+                key=item.key,
+                value=item.value,
+                updated_at=str(item.updated_at) if item.updated_at else None,
+            )
             for item in items
         ],
-    }
+    )
 
 
-@router.get("/namespaces")
+@router.get("/namespaces", response_model=NamespaceListResponse)
 def list_namespaces(
     project: str | None = Query(None),
     user: str | None = Query(None),
@@ -97,14 +105,14 @@ def list_namespaces(
 
     namespaces = store.list_namespaces(prefix=prefix, limit=limit)
 
-    return {
-        "prefix": list(prefix) if prefix else "all",
-        "count": len(namespaces),
-        "namespaces": [list(ns) for ns in namespaces],
-    }
+    return NamespaceListResponse(
+        prefix=list(prefix) if prefix else "all",
+        count=len(namespaces),
+        namespaces=[list(ns) for ns in namespaces],
+    )
 
 
-@router.get("/stats")
+@router.get("/stats", response_model=MemoryStatsResponse)
 def memory_stats():
     """Get overall memory statistics."""
     store = _get_store()
@@ -117,14 +125,14 @@ def memory_stats():
         project = ns[0] if ns else "unknown"
         by_project[project] = by_project.get(project, 0) + 1
 
-    return {
-        "total_items": total,
-        "total_namespaces": len(namespaces),
-        "by_project": by_project,
-    }
+    return MemoryStatsResponse(
+        total_items=total,
+        total_namespaces=len(namespaces),
+        by_project=by_project,
+    )
 
 
-@router.delete("/{project}/{user}/{category}/{key}")
+@router.delete("/{project}/{user}/{category}/{key}", response_model=MemoryDeleteResponse)
 def delete_memory(project: str, user: str, category: str, key: str):
     """Delete a specific memory item."""
     store = _get_store()
@@ -135,7 +143,7 @@ def delete_memory(project: str, user: str, category: str, key: str):
         raise HTTPException(404, f"Memory item not found: {namespace}/{key}")
 
     store.delete(namespace, key)
-    return {
-        "status": "ok",
-        "deleted": {"namespace": list(namespace), "key": key},
-    }
+    return MemoryDeleteResponse(
+        status="ok",
+        deleted={"namespace": list(namespace), "key": key},
+    )

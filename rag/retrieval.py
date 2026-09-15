@@ -5,6 +5,7 @@ Provides multiple retrieval approaches:
     - Hybrid search (vector + BM25 via Reciprocal Rank Fusion)
     - Reranking (cross-encoder or keyword overlap fallback)
     - Fallback retrieval (CRAG pattern)
+    - Parent expansion (retrieve children → expand to full parent context)
 """
 
 import logging
@@ -15,6 +16,95 @@ from langchain_core.documents import Document
 from rag.config import get_rag_settings
 
 logger = logging.getLogger(__name__)
+
+
+def retrieve_with_parents(
+    query: str,
+    collection_name: Optional[str] = None,
+    k: Optional[int] = None,
+    parent_max_chars: int = 4000,
+) -> "ParentRetrievalResult":
+    """Retrieve with parent expansion.
+
+    Searches for relevant children (small, precise chunks), then expands
+    each hit to its full parent (large context) from the rag_parents table.
+
+    Args:
+        query: Search query.
+        collection_name: Vector store collection.
+        k: Number of child chunks to retrieve.
+        parent_max_chars: Max characters per parent in the output (safety limit).
+
+    Returns:
+        ParentRetrievalResult with hits, context_blocks, and sources.
+    """
+    from pathlib import Path
+
+    from rag.indexing import get_vectorstore
+    from rag.parents import fetch_parents
+    from rag.schemas import ParentRetrievalResult, RetrievalHit
+
+    settings = get_rag_settings()
+    k = k or settings.retrieval_k
+    collection_name = collection_name or settings.default_collection
+
+    vs = get_vectorstore(collection_name)
+    results = vs.similarity_search(query, k=k)
+    if not results:
+        return ParentRetrievalResult()
+
+    # Collect unique parent_ids
+    parent_ids = list({r.metadata.get("parent_id") for r in results if r.metadata.get("parent_id")})
+
+    # Fetch parents
+    parent_map: dict[str, str] = {}
+    if parent_ids:
+        parents = fetch_parents(parent_ids, collection=collection_name)
+        for p in parents:
+            parent_map[p.id] = p.content[:parent_max_chars]
+
+    # Build hits and context blocks
+    hits: list[RetrievalHit] = []
+    context_blocks: list[str] = []
+    sources: list[str] = []
+
+    for i, doc in enumerate(results, 1):
+        src = doc.metadata.get("source", "?")
+        fname = Path(src).name
+        ftype = doc.metadata.get("type", "?")
+        extra = ""
+        if doc.metadata.get("class"):
+            fn = doc.metadata.get("function", "")
+            extra = f" [{doc.metadata['class']}.{fn}]" if fn else f" [{doc.metadata['class']}]"
+
+        pid = doc.metadata.get("parent_id", "")
+        parent_content = parent_map.get(pid, "")
+
+        block = f"[{i}] ({ftype}) {fname}{extra}"
+        if parent_content:
+            block += f"\n\n--- Full context ---\n{parent_content}"
+        block += f"\n\n--- Relevant section ---\n{doc.page_content}"
+        context_blocks.append(block)
+
+        hits.append(RetrievalHit(
+            content=doc.page_content,
+            source=src,
+            file_type=ftype,
+            parent_content=parent_content if parent_content else None,
+        ))
+
+        if fname not in sources:
+            sources.append(fname)
+
+    logger.info(
+        f"retrieve_with_parents: {len(results)} children → "
+        f"{len(parent_ids)} parents expanded"
+    )
+    return ParentRetrievalResult(
+        hits=hits,
+        context_blocks=context_blocks,
+        sources=sources,
+    )
 
 
 def get_retriever(collection_name: Optional[str] = None, k: Optional[int] = None):

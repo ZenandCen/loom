@@ -37,6 +37,7 @@ def inject_context(request, handler):
         f"\n## Runtime Context\n"
         f"- User: {user_id}\n"
         f"- Date: {date_str}\n"
+        f"- REMINDER: Delegate document/code/DB tasks to subagents via `task` tool. Do NOT do them yourself.\n"
     )
 
     if request.system_message and hasattr(request.system_message, "content_blocks"):

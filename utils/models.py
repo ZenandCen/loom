@@ -51,6 +51,7 @@ _openai_model = ChatOpenAI(
     api_key=os.environ.get("OPENAI_API_KEY"),
     base_url="https://code-agent.cads.live/v1",
     temperature=0,
+    max_tokens=4096,
 )
 
 try:
@@ -70,12 +71,14 @@ try:
         model=os.getenv("LOOM_MODEL_OLLAMA", "gemma:latest"),
         base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         temperature=0,
+        max_tokens=4096,
     )
 
     _fallback_model = ChatOllama(
         model=os.getenv("LOOM_MODEL_FALLBACK", "llama3.1:latest"),
         base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         temperature=0,
+        max_tokens=4096,
     )
 except ImportError:
     _ollama_model = None

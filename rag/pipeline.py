@@ -271,7 +271,7 @@ def run_rag(
     question: str,
     level: Optional[PipelineLevel] = None,
     collection_name: Optional[str] = None,
-) -> dict:
+) -> "RAGQueryResult":
     """Convenience runner: execute a RAG query end-to-end.
 
     This is the main entry point for using RAG from the loom agent.
@@ -283,11 +283,10 @@ def run_rag(
         collection_name: Vector store collection (default: from settings).
 
     Returns:
-        Dictionary with:
-            - "generation": The answer text
-            - "sources": List of source document paths
-            - "documents_count": Number of documents retrieved
+        RAGQueryResult with generation, sources, and documents_count.
     """
+    from rag.schemas import RAGQueryResult
+
     settings = get_rag_settings()
     level = level or settings.default_pipeline
     collection_name = collection_name or settings.default_collection
@@ -299,8 +298,8 @@ def run_rag(
         "query_rewrite_count": 0,
     })
 
-    return {
-        "generation": result.get("generation", ""),
-        "sources": result.get("sources", []),
-        "documents_count": len(result.get("documents", [])),
-    }
+    return RAGQueryResult(
+        generation=result.get("generation", ""),
+        sources=result.get("sources", []),
+        documents_count=len(result.get("documents", [])),
+    )

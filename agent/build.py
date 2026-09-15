@@ -18,6 +18,7 @@ from agent.middleware import (
 )
 from agent.prompt import MAIN_AGENT_PROMPT
 from agent.subagents import all_subagents
+from agent.team import build_team_graph
 from agent.tools import all_tools
 from utils.models import LLM, get_llm
 
@@ -63,3 +64,8 @@ def build_agent(llm: LLM = LLM.OPENAI):
     )
 
     return agent.with_config({"recursion_limit": 30})
+
+
+def build_team(checkpointer=None):
+    """Build the multi-agent team graph (Supervisor + parallel workers)."""
+    return build_team_graph(checkpointer=checkpointer)

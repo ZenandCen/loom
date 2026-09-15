@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # ─── Request ──────────────────────────────────────────────────────────────────
@@ -12,7 +12,7 @@ class ReindexRequest(BaseModel):
     collection: str | None = None
 
 
-# ─── Response ─────────────────────────────────────────────────────────────────
+# ─── Documents Response ───────────────────────────────────────────────────────
 
 
 class DocumentUploadResponse(BaseModel):
@@ -36,6 +36,9 @@ class DocumentDeleteResponse(BaseModel):
     note: str
 
 
+# ─── Index Response ───────────────────────────────────────────────────────────
+
+
 class IndexStatusResponse(BaseModel):
     collection: str
     chunk_count: int
@@ -47,3 +50,63 @@ class ReindexResponse(BaseModel):
     collection: str
     chunks_indexed: int
     source: str
+
+
+# ─── Memory API ───────────────────────────────────────────────────────────────
+
+
+class MemoryItem(BaseModel):
+    namespace: list[str]
+    key: str
+    value: dict
+    updated_at: str | None = None
+
+
+class MemoryQueryResponse(BaseModel):
+    project: str
+    user: str
+    category: str | None = None
+    query: str | None = None
+    count: int
+    items: list[MemoryItem] = Field(default_factory=list)
+
+
+class NamespaceListResponse(BaseModel):
+    prefix: list[str] | str
+    count: int
+    namespaces: list[list[str]] = Field(default_factory=list)
+
+
+class MemoryStatsResponse(BaseModel):
+    total_items: int
+    total_namespaces: int
+    by_project: dict[str, int] = Field(default_factory=dict)
+
+
+class MemoryDeleteResponse(BaseModel):
+    status: str
+    deleted: dict
+
+
+# ─── Slack File Handling ─────────────────────────────────────────────────────
+
+
+class SlackFileInfo(BaseModel):
+    """Metadata from a Slack file attachment event."""
+
+    id: str
+    name: str
+    filetype: str
+    size: int
+    mimetype: str
+    url_private_download: str
+
+
+class FileProcessingResult(BaseModel):
+    """Result of processing a Slack-uploaded file into RAG."""
+
+    filename: str
+    file_type: str
+    chars_extracted: int
+    chunks_indexed: int
+    collection: str

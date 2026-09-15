@@ -124,13 +124,6 @@ def multi_source_retrieve(state: RAGState) -> dict:
     except Exception as e:
         logger.warning(f"Vector retrieval failed: {e}")
 
-    # Source 2: Web search (using Tavily)
-    try:
-        web_docs = all_tools.tavily_search.invoke(question)
-        all_docs.extend(web_docs)
-    except Exception as e:
-        logger.warning(f"Web search failed: {e}")
-
     # Deduplicate by content prefix
     seen: set[str] = set()
     unique_docs: list[Document] = []

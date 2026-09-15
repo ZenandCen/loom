@@ -72,6 +72,19 @@ def _load_thread_history(thread_id: str) -> list:
 class SlackBot:
     def __init__(self, token: str):
         self.token = token
+        self._bot_user_id: str | None = None
+
+    async def get_bot_user_id(self) -> str:
+        """Get the bot's own user ID (cached)."""
+        if self._bot_user_id is None:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    "https://slack.com/api/auth.test",
+                    headers={"Authorization": f"Bearer {self.token}"},
+                )
+                data = resp.json()
+                self._bot_user_id = data.get("user_id", "")
+        return self._bot_user_id
 
     async def post_message(self, channel: str, text: str, thread_ts: str | None = None):
         payload = {"channel": channel, "text": text[:3000]}
@@ -85,6 +98,37 @@ class SlackBot:
                 headers={"Authorization": f"Bearer {self.token}"},
             )
             return resp.json()
+
+    async def delete_message(self, channel: str, ts: str) -> bool:
+        """Delete a specific message by timestamp."""
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                "https://slack.com/api/chat.delete",
+                json={"channel": channel, "ts": ts},
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+            return resp.json().get("ok", False)
+
+    async def get_thread_messages(self, channel: str, thread_ts: str, limit: int = 100) -> list[dict]:
+        """Get all messages in a thread."""
+        messages = []
+        cursor = ""
+        async with httpx.AsyncClient(timeout=30) as client:
+            while True:
+                params = {"channel": channel, "ts": thread_ts, "limit": str(limit)}
+                if cursor:
+                    params["cursor"] = cursor
+                resp = await client.get(
+                    "https://slack.com/api/conversations.history",
+                    params=params,
+                    headers={"Authorization": f"Bearer {self.token}"},
+                )
+                data = resp.json()
+                messages.extend(data.get("messages", []))
+                cursor = data.get("response_metadata", {}).get("next_cursor", "")
+                if not cursor or not data.get("has_more"):
+                    break
+        return messages
 
 
 slack_bot = SlackBot(BOT_TOKEN)
@@ -103,7 +147,11 @@ async def get_agent():
 
 # ── Helpers ─────────────────────────────────────────────────────
 def strip_bot_mention(text: str) -> str:
-    return re.sub(r"<@\w+>", "", text).strip()
+    # Strip Slack internal mention format: <@U12345>
+    text = re.sub(r"<@\w+>", "", text)
+    # Strip display name mention: @loom
+    text = re.sub(r"^@\w+\s*", "", text)
+    return text.strip()
 
 
 def verify_signature(raw_body: str, request: Request) -> bool:
@@ -150,7 +198,7 @@ async def process_message(
     config = {"configurable": {"user_id": user_id, "thread_id": thread_id}}
 
     # Command: !reset — clear conversation state for this thread
-    if msg.strip().lower() in ("!reset", "!new", "!clear"):
+    if msg.strip().lower() in ("!reset", "!new"):
         try:
             from agent.config import checkpointer
             # Clear any resume binding for this user
@@ -162,6 +210,30 @@ async def process_message(
         except Exception as e:
             await slack_bot.post_message(
                 channel_id, f"Reset: {e}", thread_ts=thread_ts
+            )
+        return
+
+    # Command: !clear — delete all messages (bot + user) from this thread
+    if msg.strip().lower() == "!clear":
+        try:
+            # Get the root thread_ts (use thread_ts if replying, else event_ts)
+            root_ts = thread_ts or event_ts
+            messages = await slack_bot.get_thread_messages(channel_id, root_ts)
+            deleted, failed = 0, 0
+            for m in messages:
+                if await slack_bot.delete_message(channel_id, m["ts"]):
+                    deleted += 1
+                else:
+                    failed += 1
+            msg_text = f"🗑️ Cleared {deleted} messages from this thread."
+            if failed:
+                msg_text += f" ({failed} could not be deleted)"
+            await slack_bot.post_message(
+                channel_id, msg_text, thread_ts=thread_ts,
+            )
+        except Exception as e:
+            await slack_bot.post_message(
+                channel_id, f"Clear error: {e}", thread_ts=thread_ts
             )
         return
 
@@ -286,31 +358,282 @@ async def process_message(
     else:
         input_messages = [{"role": "user", "content": msg}]
 
+    # === COMMAND ROUTER ===
+    # Intercept special commands before team graph
+    from agent.tools import CODE_BASE_DIR
+    msg_lower = msg.lower().strip()
+
+    # Command: list projects ("!projects" or "list projects" or "danh sách project")
+    if msg_lower in ("!projects", "list projects", "danh sách project", "danh sach project"):
+        try:
+            from pathlib import Path
+            projects = []
+            for entry in sorted(CODE_BASE_DIR.rglob("*")):
+                if entry.is_dir() and not entry.name.startswith("."):
+                    if entry.name in ("workspace", "data", "chroma_data", "node_modules", "__pycache__"):
+                        continue
+                    if any(p in {".venv", "venv", "node_modules", "__pycache__"} for p in entry.parts):
+                        continue
+                    # Only include dirs that look like projects (have source files)
+                    has_code = any(entry.glob("**/*.py")) or any(entry.glob("**/*.ts"))
+                    if has_code:
+                        rel = str(entry.relative_to(CODE_BASE_DIR))
+                        projects.append(rel)
+            lines = [f"📁 *Projects* ({len(projects)}):\n"]
+            for i, p in enumerate(projects[:20], 1):
+                lines.append(f"{i}. `{p}`")
+            if len(projects) > 20:
+                lines.append(f"... and {len(projects) - 20} more")
+            lines.append("\nUse: `project <name>` to select")
+            await slack_bot.post_message(channel_id, "\n".join(lines)[:3000], thread_ts=thread_ts)
+        except Exception as e:
+            await slack_bot.post_message(channel_id, f"List projects error: {e}", thread_ts=thread_ts)
+        return
+
+    # Command: set project ("project X" or "set project X")
+    if msg_lower.startswith("project ") or msg_lower.startswith("set project "):
+        project_path = msg.replace("set ", "", 1) if msg_lower.startswith("set ") else msg
+        project_path = project_path.replace("project ", "", 1).strip()
+        try:
+            from agent.tools import set_project, _get_project_dir
+            from rag.code_indexer import SKIP_DIRS, CODE_EXTENSIONS
+            from pathlib import Path
+
+            result = set_project.invoke({"path": project_path})
+
+            # If not found directly, try fuzzy search by name
+            if result.startswith("Error"):
+                matches = []
+                for p in CODE_BASE_DIR.rglob("*"):
+                    if p.is_dir() and p.name == project_path:
+                        if any(skip in p.parts for skip in SKIP_DIRS):
+                            continue
+                        matches.append(p)
+                if len(matches) == 1:
+                    rel = str(matches[0].relative_to(CODE_BASE_DIR))
+                    set_project.invoke({"path": rel})
+                elif len(matches) > 1:
+                    rels = [str(m.relative_to(CODE_BASE_DIR)) for m in matches]
+                    await slack_bot.post_message(
+                        channel_id,
+                        f"⚠️ Multiple matches for '{project_path}':\n" +
+                        "\n".join(f"{i}. `{r}`" for i, r in enumerate(rels, 1)) +
+                        "\n\nUse full path: `project <relative/path>`",
+                        thread_ts=thread_ts,
+                    )
+                    return
+                else:
+                    # Show available top-level dirs
+                    available = sorted([
+                        str(e.relative_to(CODE_BASE_DIR))
+                        for e in CODE_BASE_DIR.iterdir()
+                        if e.is_dir() and not e.name.startswith(".")
+                    ])[:15]
+                    await slack_bot.post_message(
+                        channel_id,
+                        f"❌ Project '{project_path}' not found.\n\n"
+                        f"Available directories:\n" +
+                        "\n".join(f"  - `{a}`" for a in available) +
+                        "\n\nUse: `project <relative/path>` or `!projects` to list all",
+                        thread_ts=thread_ts,
+                    )
+                    return
+
+            project_dir = _get_project_dir()
+            if str(project_dir) == str(CODE_BASE_DIR):
+                await slack_bot.post_message(
+                    channel_id, f"❌ Could not resolve project '{project_path}'.", thread_ts=thread_ts
+                )
+                return
+            collection = project_dir.name.lower().replace("-", "_").replace(" ", "_")
+
+            # Scan project for docs + code
+            doc_exts = {".pdf", ".md", ".txt", ".html", ".docx", ".csv", ".xlsx", ".xls"}
+            n_docs, n_code = 0, 0
+            for f in project_dir.rglob("*"):
+                if not f.is_file() or f.name.startswith("."):
+                    continue
+                if any(p in SKIP_DIRS for p in f.parts):
+                    continue
+                if f.suffix.lower() in doc_exts:
+                    n_docs += 1
+                elif f.suffix.lower() in CODE_EXTENSIONS:
+                    n_code += 1
+
+            # Show relative path if not at top level
+            rel_display = ""
+            try:
+                rel = project_dir.relative_to(CODE_BASE_DIR)
+                if str(rel) != rel.name:
+                    rel_display = f" (`{rel}`)"
+            except ValueError:
+                pass
+
+            await slack_bot.post_message(
+                channel_id,
+                f"✅ Project: **{project_dir.name}**{rel_display}\n"
+                f"Collection: `{collection}`\n\n"
+                f"📄 Docs: {n_docs} files\n"
+                f"💻 Code: {n_code} files\n\n"
+                f"Gửi `học tất cả` để index toàn bộ, hoặc:\n"
+                f"- `reindex docs` — chỉ tài liệu\n"
+                f"- `index code` — chỉ source code",
+                thread_ts=thread_ts,
+            )
+        except Exception as e:
+            await slack_bot.post_message(channel_id, f"Set project error: {e}", thread_ts=thread_ts)
+        return
+
+    # Command: reindex docs ("reindex docs", "học tài liệu", "index docs")
+    if any(kw in msg_lower for kw in ["reindex docs", "học tài liệu", "index docs", "reindex folder docs", "học docs", "index folder docs"]):
+        try:
+            from agent.tools import _get_project_dir, get_active_collection
+            from rag.indexing import load_documents, get_vectorstore
+            from rag.chunking import ChunkingConfig, chunk_documents
+            from rag.code_indexer import SKIP_DIRS
+
+            project_dir = _get_project_dir()
+            if str(project_dir) == str(CODE_BASE_DIR):
+                await slack_bot.post_message(channel_id, "❌ Set project trước: `project <path>`", thread_ts=thread_ts)
+                return
+
+            await slack_bot.post_message(channel_id, "📚 Đang index tài liệu (toàn bộ project)...", thread_ts=thread_ts)
+
+            import rag.indexing as idx
+            orig_ext = idx.SUPPORTED_EXTENSIONS.copy()
+            idx.SUPPORTED_EXTENSIONS = orig_ext - {".html"}  # skip .html duplicates
+
+            collection = get_active_collection()
+            # Scan entire project (not just docs/)
+            docs = load_documents(project_dir)
+            chunks = chunk_documents(docs, ChunkingConfig())
+            vs = get_vectorstore(collection)
+            vs.add_documents(chunks)
+            files = set(d.metadata.get("source", "?").split("/")[-1] for d in docs)
+
+            idx.SUPPORTED_EXTENSIONS = orig_ext
+
+            await slack_bot.post_message(
+                channel_id,
+                f"✅ Đã index **{len(files)} files** → **{len(chunks)} chunks**\n"
+                f"Collection: `{collection}`\n\n"
+                f"Files: {', '.join(sorted(files)[:10])}{'...' if len(files) > 10 else ''}",
+                thread_ts=thread_ts,
+            )
+        except Exception as e:
+            await slack_bot.post_message(channel_id, f"Reindex error: {e}", thread_ts=thread_ts)
+        return
+
+    # Command: index code ("index code", "reindex code", "học code", "index python")
+    if any(kw in msg_lower for kw in ["index code", "reindex code", "học code", "index python", "reindex python", "index source"]):
+        try:
+            from agent.tools import _get_project_dir, get_active_collection
+            from rag.code_indexer import index_code_directory
+
+            project_dir = _get_project_dir()
+            if str(project_dir) == str(CODE_BASE_DIR):
+                await slack_bot.post_message(channel_id, "❌ Set project trước: `project <path>`", thread_ts=thread_ts)
+                return
+
+            await slack_bot.post_message(channel_id, "💻 Đang index Python files...", thread_ts=thread_ts)
+
+            collection = get_active_collection()
+            n = index_code_directory(project_dir, collection)
+
+            await slack_bot.post_message(
+                channel_id,
+                f"✅ Đã index **{n} code chunks** (AST-based, per function/class)\n"
+                f"Collection: `{collection}`\n\n"
+                f"Bây giờ có thể hỏi về code, architecture, flow...",
+                thread_ts=thread_ts,
+            )
+        except Exception as e:
+            await slack_bot.post_message(channel_id, f"Index code error: {e}", thread_ts=thread_ts)
+        return
+
+    # Command: reindex all (docs + code) ("reindex all", "học tất cả", "index all")
+    if any(kw in msg_lower for kw in ["reindex all", "học tất cả", "index all", "reindex tất cả", "học project"]):
+        try:
+            from agent.tools import _get_project_dir, get_active_collection
+            from rag.indexing import load_documents, get_vectorstore
+            from rag.chunking import ChunkingConfig, chunk_documents
+            from rag.code_indexer import index_code_directory
+
+            project_dir = _get_project_dir()
+            if str(project_dir) == str(CODE_BASE_DIR):
+                await slack_bot.post_message(channel_id, "❌ Set project trước: `project <path>`", thread_ts=thread_ts)
+                return
+
+            await slack_bot.post_message(channel_id, "📚 Đang index docs + code (toàn bộ project)...", thread_ts=thread_ts)
+
+            collection = get_active_collection()
+            total_chunks = 0
+
+            # Index docs (entire project tree, skip .html)
+            import rag.indexing as idx
+            orig_ext = idx.SUPPORTED_EXTENSIONS.copy()
+            idx.SUPPORTED_EXTENSIONS = orig_ext - {".html"}
+            docs = load_documents(project_dir)
+            chunks = chunk_documents(docs, ChunkingConfig())
+            vs = get_vectorstore(collection)
+            vs.add_documents(chunks)
+            idx.SUPPORTED_EXTENSIONS = orig_ext
+            total_chunks += len(chunks)
+            n_docs = len(set(d.metadata.get("source", "?").split("/")[-1] for d in docs))
+
+            # Index code (Python + TypeScript, entire project tree)
+            n_code = index_code_directory(project_dir, collection)
+            total_chunks += n_code
+
+            await slack_bot.post_message(
+                channel_id,
+                f"✅ Done!\n"
+                f"📄 Docs: {n_docs} files\n"
+                f"💻 Code: {n_code} chunks\n"
+                f"📊 Total: {total_chunks} chunks → `{collection}`\n\n"
+                f"Bây giờ có thể hỏi về project...",
+                thread_ts=thread_ts,
+            )
+        except Exception as e:
+            await slack_bot.post_message(channel_id, f"Reindex all error: {e}", thread_ts=thread_ts)
+        return
+
+    # === END COMMAND ROUTER ===
+
     logger.info(f"AI processing... (User={user_id}, Ch={channel_id}, thread_id={config['configurable']['thread_id']})")
     try:
-        agent = await get_agent()
+        # Use team graph (Supervisor + parallel workers)
+        from agent.build import build_team
+        from agent.team.schemas import TeamInput
+        from agent.team.synthesizer import build_team_output
+        from agent.tools import _get_project_dir, CODE_BASE_DIR
 
-        # Middleware only supports sync — run in thread executor
-        result = await asyncio.to_thread(
-            agent.invoke,
-            {"messages": input_messages},
-            config,
+        team = build_team()
+
+        # Build validated input
+        project_dir = _get_project_dir()
+        project_name = "" if project_dir == CODE_BASE_DIR else project_dir.name
+        team_input = TeamInput(
+            user_query=msg,
+            user_id=user_id,
+            project=project_name,
         )
 
-        # Extract final AI message
-        response = ""
-        for message in reversed(result.get("messages", [])):
-            if hasattr(message, "type") and message.type == "ai" and message.content:
-                response = message.content if isinstance(message.content, str) else str(message.content)
-                break
-            elif isinstance(message, dict) and message.get("role") == "assistant" and message.get("content"):
-                response = message["content"]
-                break
+        team_config = {"configurable": {"thread_id": config["configurable"]["thread_id"]}}
 
-        if not response:
+        raw_result = await team.ainvoke(
+            team_input.model_dump(),
+            team_config,
+        )
+
+        # Build structured output
+        output = build_team_output(raw_result)
+        response = output.to_slack_text()
+
+        if not response or response == "I processed your request but have no response to share.":
             response = "I processed your request but have no response to share."
 
-        logger.info(f"AI reply generated ({len(response)} chars). Posting to Slack...")
+        logger.info(f"AI reply: {len(response)} chars, {len(output.workers)} workers, diagram={output.diagram_type.value}")
         result_slack = await slack_bot.post_message(channel_id, response, thread_ts=thread_ts)
         if result_slack.get("ok"):
             logger.info(f"Message posted to Slack successfully")

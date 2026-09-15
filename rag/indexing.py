@@ -14,9 +14,9 @@ from typing import Optional
 
 from langchain_core.documents import Document
 
-from rag.chunking import ChunkingConfig, chunk_documents
+from rag.chunking import ChunkingConfig, chunk_documents, chunk_documents_with_parents
 from rag.config import get_embeddings, get_rag_settings
-from rag.enums import VectorDBType
+from rag.enums import ChunkingStrategy, VectorDBType
 
 logger = logging.getLogger(__name__)
 
@@ -228,18 +228,29 @@ def index_documents(
     chunking_config = chunking_config or ChunkingConfig()
 
     # Step 1: Load raw documents from disk
-    logger.info("Step 1/3: Loading documents...")
+    logger.info("Step 1/4: Loading documents...")
     documents = load_documents(input_dir)
     if not documents:
         logger.warning("No documents found to index.")
         return 0
 
     # Step 2: Chunk documents using the configured strategy
-    logger.info(f"Step 2/3: Chunking ({chunking_config.strategy.value})...")
-    chunks = chunk_documents(documents, chunking_config, llm=llm)
+    logger.info(f"Step 2/4: Chunking ({chunking_config.strategy.value})...")
+    if chunking_config.strategy == ChunkingStrategy.PARENT_CHILD:
+        chunks, parent_records = chunk_documents_with_parents(documents, chunking_config, llm=llm)
+    else:
+        chunks = chunk_documents(documents, chunking_config, llm=llm)
+        parent_records = []
 
-    # Step 3: Embed and store in vector DB
-    logger.info("Step 3/3: Embedding and storing...")
+    # Step 3: Store parent records (if any)
+    if parent_records:
+        logger.info(f"Step 3/4: Storing {len(parent_records)} parent records...")
+        from rag.parents import store_parents, clear_collection
+        clear_collection(collection_name)
+        store_parents(parent_records, collection_name)
+
+    # Step 4: Embed and store in vector DB
+    logger.info("Step 4/4: Embedding and storing...")
     vectorstore = get_vectorstore(collection_name)
     vectorstore.add_documents(chunks)
 

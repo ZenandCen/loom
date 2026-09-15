@@ -35,9 +35,9 @@ def rag_query(query: str, pipeline_level: str = "adaptive") -> str:
     result = run_rag(query, level=level, collection_name=collection)
 
     # Format the response for the agent
-    answer = result.get("generation", "No answer generated.")
-    sources = result.get("sources", [])
-    docs_count = result.get("documents_count", 0)
+    answer = result.generation or "No answer generated."
+    sources = result.sources
+    docs_count = result.documents_count
 
     response = f"{answer}"
     if sources:

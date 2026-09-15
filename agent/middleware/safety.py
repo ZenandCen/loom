@@ -13,7 +13,7 @@ class BudgetError(Exception):
 
 DANGEROUS_TOOLS = {"send_email", "delete", "execute"}
 
-MAX_MODEL_CALLS = 15
+MAX_MODEL_CALLS = 25
 
 
 @wrap_model_call

@@ -94,6 +94,19 @@ try:
                 PRIMARY KEY (thread_id, channel, version)
             )
         """)
+        _setup_cur.execute("""
+            CREATE TABLE IF NOT EXISTS rag_parents (
+                id TEXT PRIMARY KEY,
+                collection TEXT NOT NULL,
+                source TEXT,
+                content TEXT NOT NULL,
+                metadata JSONB DEFAULT '{}',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        _setup_cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_rag_parents_collection ON rag_parents(collection)
+        """)
         _setup_conn.close()
 
         # Use pool for runtime operations
