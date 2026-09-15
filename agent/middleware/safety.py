@@ -20,13 +20,15 @@ MAX_MODEL_CALLS = 15
 def budget_guard(request, handler):
     """Limit max model calls per run. Raise BudgetError when exceeded."""
     config = get_config()
-    call_count = config.get("configurable", {}).get("_model_call_count", 0) + 1
+    configurable = config.get("configurable", {})
+    call_count = configurable.get("_model_call_count", 0) + 1
 
     if call_count > MAX_MODEL_CALLS:
         raise BudgetError(
             f"Budget exceeded: {MAX_MODEL_CALLS} model calls per run"
         )
 
+    configurable["_model_call_count"] = call_count
     return handler(request)
 
 

@@ -55,11 +55,50 @@ from utils.models import LLM, get_llm  # noqa: F401
 _pg_dsn = os.getenv("RAG_PG_DSN", "")
 try:
     if _pg_dsn:
+        import psycopg
         from psycopg_pool import ConnectionPool
         from langgraph.checkpoint.postgres import PostgresSaver
+
+        # Run DDL setup with autocommit (CREATE INDEX CONCURRENTLY requires it)
+        _setup_conn = psycopg.connect(_pg_dsn, autocommit=True)
+        _setup_cur = _setup_conn.cursor()
+        _setup_cur.execute("""
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                thread_id TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                parent_checkpoint_id TEXT,
+                checkpoint JSONB NOT NULL,
+                metadata JSONB NOT NULL DEFAULT '{}',
+                PRIMARY KEY (thread_id, checkpoint_id)
+            )
+        """)
+        _setup_cur.execute("""
+            CREATE TABLE IF NOT EXISTS checkpoint_writes (
+                thread_id TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                channel TEXT NOT NULL,
+                type TEXT,
+                blob BYTEA NOT NULL,
+                PRIMARY KEY (thread_id, checkpoint_id, task_id, idx)
+            )
+        """)
+        _setup_cur.execute("""
+            CREATE TABLE IF NOT EXISTS checkpoint_blobs (
+                thread_id TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                version TEXT NOT NULL,
+                type TEXT NOT NULL,
+                blob BYTEA NOT NULL,
+                PRIMARY KEY (thread_id, channel, version)
+            )
+        """)
+        _setup_conn.close()
+
+        # Use pool for runtime operations
         _pg_pool = ConnectionPool(_pg_dsn, open=True, min_size=1, max_size=5)
         checkpointer = PostgresSaver(_pg_pool)
-        checkpointer.setup()
         print(f"  [CHECKPOINTER] PostgresSaver (pool) ready")
     else:
         from langgraph.checkpoint.memory import MemorySaver

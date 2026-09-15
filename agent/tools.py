@@ -118,25 +118,33 @@ def set_project(path: str) -> str:
 
 
 @tool(parse_docstring=True)
-def read_file(path: str) -> str:
-    """Read the contents of a source code file in the active project.
+def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
+    """Read a source code file. Supports pagination for large files.
 
     Args:
         path: Relative path to the file (e.g. 'src/main.py')
+        start_line: First line to read (1-based, 0 = from beginning)
+        end_line: Last line to read (0 = to end)
     """
     project_dir = _get_project_dir()
     file_path = (project_dir / path).resolve()
     if not str(file_path).startswith(str(CODE_BASE_DIR.resolve())):
         return "Error: Access denied. Path must be within the code base."
     if not file_path.exists():
-        return f"Error: File '{path}' not found in '{project_dir.name}'."
+        file_path = (CODE_BASE_DIR / path).resolve()
+        if not file_path.exists():
+            return f"Error: File '{path}' not found in '{project_dir.name}'."
     if not file_path.is_file():
         return f"Error: '{path}' is not a file."
     try:
-        content = file_path.read_text(encoding="utf-8")
-        if len(content) > 50000:
-            return content[:50000] + f"\n\n... [truncated, file is {len(content)} chars total]"
-        return content
+        lines = file_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        total = len(lines)
+        s = max(start_line - 1, 0) if start_line > 0 else 0
+        e = min(end_line, total) if end_line > 0 else total
+        chunk = lines[s:e]
+        content = "".join(chunk)
+        header = f"[{file_path.name}: lines {s+1}-{e} of {total}]\n"
+        return header + content
     except Exception as e:
         return f"Error reading file: {e}"
 
@@ -204,6 +212,89 @@ def search_code(pattern: str, path: str = ".") -> str:
 
 
 @tool(parse_docstring=True)
+def read_folder(path: str = ".", max_lines_per_file: int = 200, overlap: int = 20) -> str:
+    """Read ALL files in a folder in parallel. Large files are chunked with overlap.
+
+    Uses parallel workers to speed up reading. Each file is read in overlapping
+    chunks to ensure no data is lost at boundaries.
+
+    Args:
+        path: Folder path relative to active project
+        max_lines_per_file: Max lines per chunk before paginating (default 200)
+        overlap: Lines of overlap between chunks to prevent data loss (default 20)
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    project_dir = _get_project_dir()
+    dir_path = (project_dir / path).resolve()
+    if not dir_path.exists():
+        dir_path = (CODE_BASE_DIR / path).resolve()
+    if not dir_path.exists() or not dir_path.is_dir():
+        return f"Error: Directory '{path}' not found."
+
+    skip_dirs = {".git", ".venv", "__pycache__", "node_modules", "chroma_data"}
+    skip_exts = {".png", ".jpg", ".jpeg", ".pdf", ".zip", ".pyc", ".so", ".bin", ".ico", ".wasm", ".xlsx", ".xls", ".docx"}
+
+    # Collect all files
+    files = []
+    for f in sorted(dir_path.rglob("*")):
+        if f.is_file() and not f.name.startswith("."):
+            if f.suffix.lower() not in skip_exts:
+                parts = f.parts
+                if not any(p in skip_dirs for p in parts):
+                    files.append(f)
+
+    if not files:
+        return f"No readable files in '{path}'."
+
+    def _read_one_file(fpath: Path) -> str:
+        """Read a single file with pagination + overlap."""
+        try:
+            lines = fpath.read_text(encoding="utf-8").splitlines(keepends=True)
+        except Exception:
+            return f"--- {fpath.name} (binary/unreadable) ---"
+
+        rel = fpath.relative_to(dir_path)
+        total = len(lines)
+
+        if total <= max_lines_per_file:
+            return f"--- {rel} ({total} lines) ---\n{''.join(lines)}"
+
+        # Paginate with overlap
+        chunks = []
+        pos = 0
+        chunk_num = 0
+        while pos < total:
+            end = min(pos + max_lines_per_file, total)
+            chunk_lines = lines[pos:end]
+            chunk_num += 1
+            chunks.append(f"[{rel} chunk {chunk_num}: lines {pos+1}-{end}/{total}]\n{''.join(chunk_lines)}")
+            if end >= total:
+                break
+            # Next chunk starts WITHIN current chunk (overlap)
+            pos = end - overlap
+
+        return "\n\n".join(chunks)
+
+    # Read files in parallel
+    results = [f"--- {f.relative_to(dir_path)} ---\n(read failed)" for f in files]
+    with ThreadPoolExecutor(max_workers=min(8, len(files))) as executor:
+        futures = {executor.submit(_read_one_file, f): i for i, f in enumerate(files)}
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                results[idx] = future.result()
+            except Exception as e:
+                results[idx] = f"--- {files[idx].name} ---\nError: {e}"
+
+    # Limit total output
+    output = "\n\n".join(results)
+    if len(output) > 80000:
+        output = output[:80000] + f"\n\n[OUTPUT LIMIT: {len(output)}+ chars. {len(files)} files total. Read specific files individually for full content.]"
+    return f"📂 {path}/ — {len(files)} files (parallel read, overlap={overlap}):\n\n{output}"
+
+
+@tool(parse_docstring=True)
 def reindex_file(path: str, collection: str = "") -> str:
     """Embed and index a document file into the RAG vector store.
 
@@ -232,6 +323,42 @@ def reindex_file(path: str, collection: str = "") -> str:
         return f"Indexed '{file_path.name}' → {len(chunks)} chunks in '{collection}'."
     except Exception as e:
         return f"Reindex failed: {e}"
+
+
+@tool(parse_docstring=True)
+def reindex_folder(path: str, collection: str = "") -> str:
+    """Index ALL supported documents in a folder into the RAG vector store.
+
+    Recursively scans the folder for supported files (.pdf, .md, .txt, .html, .docx, .csv, .xlsx),
+    loads them, chunks them, embeds them, and stores them in the vector DB.
+    Use this instead of calling reindex_file multiple times for a folder of documents.
+
+    Args:
+        path: Folder path (relative to active project, or absolute)
+        collection: Override collection name (default: active project's collection)
+    """
+    project_dir = _get_project_dir()
+    folder_path = (project_dir / path).resolve() if not Path(path).is_absolute() else Path(path).resolve()
+    if not folder_path.exists():
+        folder_path = (CODE_BASE_DIR / path).resolve()
+    if not folder_path.exists() or not folder_path.is_dir():
+        return f"Error: Folder '{path}' not found."
+
+    from rag.indexing import load_documents, get_vectorstore
+    from rag.chunking import ChunkingConfig, chunk_documents
+
+    collection = collection or get_active_collection()
+    try:
+        docs = load_documents(folder_path)
+        if not docs:
+            return f"No supported documents found in '{folder_path}'. Supported: .pdf, .md, .txt, .html, .docx, .csv, .xlsx"
+        chunks = chunk_documents(docs, ChunkingConfig())
+        vs = get_vectorstore(collection)
+        vs.add_documents(chunks)
+        files = set(d.metadata.get("source", "?").split("/")[-1] for d in docs)
+        return f"Indexed {len(files)} files → {len(chunks)} chunks in '{collection}' collection.\nFiles: {', '.join(sorted(files)[:15])}"
+    except Exception as e:
+        return f"Reindex folder failed: {e}"
 
 
 @tool(parse_docstring=True)
@@ -294,10 +421,13 @@ def query_database(sql: str) -> str:
         if not rows:
             return "Query returned 0 rows."
 
+        limit = 10
+        shown = rows[:limit]
+
         # Format as table
         max_widths = [len(c) for c in cols]
         str_rows = []
-        for row in rows[:50]:  # limit to 50 rows
+        for row in shown:
             str_row = [str(v) if v is not None else "NULL" for v in row]
             str_rows.append(str_row)
             for i, v in enumerate(str_row):
@@ -308,8 +438,8 @@ def query_database(sql: str) -> str:
         body = "\n".join(" | ".join(v.ljust(max_widths[i]) for i, v in enumerate(r)) for r in str_rows)
 
         result = f"{header}\n{separator}\n{body}"
-        if len(rows) > 50:
-            result += f"\n... ({len(rows) - 50} more rows)"
+        if len(rows) > limit:
+            result += f"\n... showing {limit}/{len(rows)} rows. Use LIMIT/OFFSET for more."
         return result
 
     except Exception as e:
@@ -368,9 +498,11 @@ all_tools = [
     set_project,
     list_projects,
     read_file,
+    read_folder,
     list_directory,
     search_code,
     reindex_file,
+    reindex_folder,
     query_database,
     list_tables,
     *all_rag_tools,

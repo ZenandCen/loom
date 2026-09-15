@@ -35,6 +35,39 @@ VERIFY_SIG = os.getenv("SLACK_VERIFY", "true").lower() == "true"
 _processed_events: set[str] = set()
 _event_lock = asyncio.Lock()
 
+# Resume map: user_id → target thread_id (persistent until !reset or new !resume)
+_resume_map: dict[str, str] = {}
+
+
+def _load_thread_history(thread_id: str) -> list:
+    """Load full message history from checkpoint_writes for a given thread."""
+    try:
+        import psycopg
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+        from agent.config import _pg_dsn
+
+        serde = JsonPlusSerializer()
+        conn = psycopg.connect(_pg_dsn, autocommit=True)
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT type, blob FROM checkpoint_writes
+               WHERE thread_id = %s AND channel = 'messages'
+               ORDER BY checkpoint_id ASC, idx ASC""",
+            (thread_id,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+        messages = []
+        for typ, blob in rows:
+            data = serde.loads_typed((typ, blob))
+            if isinstance(data, list):
+                messages.extend(data)
+        return messages
+    except Exception as e:
+        logger.error(f"Failed to load thread history: {e}")
+        return []
+
 
 class SlackBot:
     def __init__(self, token: str):
@@ -120,6 +153,8 @@ async def process_message(
     if msg.strip().lower() in ("!reset", "!new", "!clear"):
         try:
             from agent.config import checkpointer
+            # Clear any resume binding for this user
+            _resume_map.pop(user_id, None)
             checkpointer.delete_thread(thread_id)
             await slack_bot.post_message(
                 channel_id, "Conversation reset. Starting fresh.", thread_ts=thread_ts
@@ -130,14 +165,135 @@ async def process_message(
             )
         return
 
-    logger.info(f"AI processing... (User={user_id}, Ch={channel_id})")
+    # Command: !sessions — list all sessions with summaries
+    if msg.strip().lower() in ("!sessions", "!list", "!ls"):
+        try:
+            from agent.config import _pg_dsn
+            import psycopg
+
+            conn = psycopg.connect(_pg_dsn, autocommit=True)
+            cur = conn.cursor()
+            # Get distinct thread_ids (one row per thread, latest checkpoint)
+            cur.execute("""
+                SELECT DISTINCT thread_id
+                FROM checkpoints
+            """)
+            threads = [r[0] for r in cur.fetchall()]
+            # Sort by thread_id (Slack event_ts = chronological)
+            threads.sort(reverse=True)
+            conn.close()
+
+            if not threads:
+                await slack_bot.post_message(channel_id, "No sessions found.", thread_ts=thread_ts)
+                return
+
+            import msgpack
+            lines = [f"📋 *Sessions* ({len(threads)} total):\n"]
+            for i, tid in enumerate(threads[:5], 1):
+                # Get first user message as summary from __start__ channel
+                summary = ""
+                try:
+                    conn2 = psycopg.connect(_pg_dsn, autocommit=True)
+                    cur2 = conn2.cursor()
+                    cur2.execute("""
+                        SELECT blob FROM checkpoint_blobs
+                        WHERE thread_id = %s AND channel = '__start__'
+                        ORDER BY version ASC LIMIT 1
+                    """, (tid,))
+                    row = cur2.fetchone()
+                    conn2.close()
+
+                    if row:
+                        data = msgpack.unpackb(row[0], raw=False)
+                        if isinstance(data, dict):
+                            msgs = data.get("messages", [])
+                            for m in msgs:
+                                if isinstance(m, dict) and m.get("role") == "user":
+                                    content = m.get("content", "")
+                                    if isinstance(content, list):
+                                        content = " ".join(
+                                            b.get("text", "") for b in content if isinstance(b, dict)
+                                        )
+                                    if content.strip():
+                                        summary = content.strip()[:40]
+                                        break
+                except Exception:
+                    pass
+
+                lines.append(f"{i}. `{tid[:14]}` — {summary or '(empty)'}")
+
+            lines.append("\nResume: `!resume <id>`")
+            await slack_bot.post_message(channel_id, "\n".join(lines)[:3000], thread_ts=thread_ts)
+        except Exception as e:
+            await slack_bot.post_message(channel_id, f"Sessions error: {e}", thread_ts=thread_ts)
+        return
+
+    # Command: !resume <id> — resume a previous session
+    if msg.strip().lower().startswith("!resume"):
+        parts = msg.strip().split(maxsplit=1)
+        if len(parts) < 2:
+            await slack_bot.post_message(
+                channel_id, "Usage: `!resume <session_id>` (use !sessions to list)", thread_ts=thread_ts
+            )
+            return
+
+        session_id = parts[1].strip().strip("`")
+        # Find full thread_id matching the prefix
+        try:
+            from agent.config import _pg_dsn
+            import psycopg
+
+            conn = psycopg.connect(_pg_dsn, autocommit=True)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT thread_id FROM checkpoints WHERE thread_id LIKE %s LIMIT 1",
+                (f"{session_id}%",),
+            )
+            row = cur.fetchone()
+            conn.close()
+
+            if not row:
+                await slack_bot.post_message(
+                    channel_id, f"Session '{session_id}' not found. Use `!sessions` to list.", thread_ts=thread_ts
+                )
+                return
+
+            full_thread_id = row[0]
+            await slack_bot.post_message(
+                channel_id,
+                f"✅ Resumed session `{full_thread_id[:14]}`. Next message will continue that conversation.",
+                thread_ts=thread_ts,
+            )
+            # Store the resume target by user_id (works across threads)
+            _resume_map[user_id] = full_thread_id
+
+        except Exception as e:
+            await slack_bot.post_message(channel_id, f"Resume error: {e}", thread_ts=thread_ts)
+        return
+
+    # Check if this user has a pending/persistent resume
+    if user_id in _resume_map:
+        old_thread_id = _resume_map[user_id]
+        config["configurable"]["thread_id"] = old_thread_id
+        logger.info(f"RESUME: user={user_id} using old session thread_id={old_thread_id}")
+        # Load full message history from checkpoint_writes
+        history = _load_thread_history(old_thread_id)
+        if history:
+            logger.info(f"RESUME: loaded {len(history)} messages from history")
+            input_messages = history + [{"role": "user", "content": msg}]
+        else:
+            input_messages = [{"role": "user", "content": msg}]
+    else:
+        input_messages = [{"role": "user", "content": msg}]
+
+    logger.info(f"AI processing... (User={user_id}, Ch={channel_id}, thread_id={config['configurable']['thread_id']})")
     try:
         agent = await get_agent()
 
         # Middleware only supports sync — run in thread executor
         result = await asyncio.to_thread(
             agent.invoke,
-            {"messages": [{"role": "user", "content": msg}]},
+            {"messages": input_messages},
             config,
         )
 
