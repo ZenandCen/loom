@@ -137,114 +137,111 @@ def rag_worker(state: dict) -> dict:
 
 
 def code_worker(state: dict) -> dict:
-    """Code worker: RAG with parent expansion + read key files → LLM explains."""
+    """Code worker: ReAct agent that explores codebase iteratively."""
     task = state.get("task", "")
     project = state.get("project", "")
     logger.info(f"[CODE WORKER] project={project} task={task[:100]}")
 
-    from agent.tools import CODE_BASE_DIR, _get_project_dir, get_active_collection
+    from agent.tools import (
+        list_directory, read_file, search_code,
+        CODE_BASE_DIR, _get_project_dir,
+    )
+    from rag.tool import rag_query
+
     if project:
         project_dir = CODE_BASE_DIR / project
         if not project_dir.exists():
             project_dir = _get_project_dir()
     else:
         project_dir = _get_project_dir()
-    context_parts = []
 
-    # 1. Directory structure (top-level only)
-    try:
-        entries = sorted(project_dir.iterdir())
-        tree = "Project structure:\n"
-        for e in entries[:30]:
-            if e.name.startswith(".") or e.name in (".venv", "venv"):
-                continue
-            if e.is_dir():
-                sub_files = list(e.iterdir())[:5]
-                tree += f"  {e.name}/\n"
-                for sf in sub_files:
-                    tree += f"    {sf.name}\n"
-            else:
-                tree += f"  {e.name}\n"
-        context_parts.append(tree)
-    except Exception:
-        pass
+    from langchain.agents import create_agent
 
-    # 2. RAG search with parent expansion for code
-    try:
-        from rag.retrieval import retrieve_with_parents
-        collection = get_active_collection()
-        code_result = retrieve_with_parents(task, collection_name=collection, k=8)
-        code_blocks = code_result.context_blocks
-        if code_blocks:
-            context_parts.append("Relevant code (with full file context):\n" + "\n\n---\n\n".join(code_blocks[:6]))
-    except Exception as e:
-        logger.warning(f"Code RAG parent search failed, falling back: {e}")
-        try:
-            from rag.indexing import get_vectorstore
-            collection = get_active_collection()
-            vs = get_vectorstore(collection)
-            code_results = vs.similarity_search(task, k=8)
-            code_chunks = []
-            for doc in code_results:
-                if doc.metadata.get("type") == "code":
-                    src = doc.metadata.get("source", "")
-                    rel = src.replace(str(project_dir) + "/", "") if src.startswith(str(project_dir)) else src
-                    code_chunks.append(f"[{rel}]\n{doc.page_content[:600]}")
-            if code_chunks:
-                context_parts.append("Relevant code (from RAG):\n" + "\n\n---\n\n".join(code_chunks[:5]))
-        except Exception as e2:
-            logger.warning(f"Code RAG fallback also failed: {e2}")
-
-    # 3. If task mentions specific files, read them
-    import re
-    mentioned_files = re.findall(r'[\w/._-]+\.py', task)
-    for mf in mentioned_files[:2]:
-        fpath = project_dir / mf
-        if fpath.exists():
-            try:
-                lines = fpath.read_text(encoding="utf-8").splitlines(keepends=True)
-                head = lines[:100]
-                context_parts.append(f"--- {mf} (first 100 of {len(lines)} lines) ---\n{''.join(head)}")
-            except Exception:
-                continue
-
-    context = "\n\n".join(context_parts) if context_parts else "(no files found)"
-
-    # Collect sources
-    sources: list[str] = []
-    for part in context_parts:
-        if part.startswith("["):
-            src = part.split("]")[0].lstrip("[")
-            if src and src not in sources:
-                sources.append(src)
-
-    result = _llm_summarize(
-        system="You are a code architect. Explain how the code works based on the provided file structure, RAG code chunks (with full file context), and file samples. Reference file:line. Be structured and concise. Answer in the same language as the task.",
-        context=context,
-        task=task,
+    agent = create_agent(
+        model=_worker_model,
+        tools=[list_directory, read_file, search_code, rag_query],
+        system_prompt=(
+            f"You are a code architect analyzing the project: {project_dir.name}\n"
+            "Workflow:\n"
+            "1. Start with `list_directory` to understand the project structure.\n"
+            "2. Use `search_code` to find relevant functions, classes, or patterns.\n"
+            "3. Use `read_file` to examine specific files (use start_line/end_line for large files).\n"
+            "4. Use `rag_query` for semantic search when you don't know which file to look at.\n"
+            "5. Follow imports and dependencies: if a file references another module, read that too.\n\n"
+            "Rules:\n"
+            "- Maximum 6 tool calls. Prioritize the most important files.\n"
+            "- Always reference file:line in your answer.\n"
+            "- For architecture questions, focus on entry points, key abstractions, and data flow.\n"
+            "- For 'how does X work' questions, trace the code path step by step.\n"
+            "- Be structured: use headings, bullet points, and code snippets.\n"
+            "- Answer in the same language as the user's question.\n"
+            "- If the codebase is large, focus on the most relevant 3-5 files."
+        ),
     )
-    logger.info(f"[CODE WORKER] Done: {len(result)} chars, {len(sources)} sources")
-    return {"code_result": result, "code_sources": sources}
+
+    try:
+        result = agent.invoke({"messages": [("user", task)]}, config={"recursion_limit": 15})
+        content = result["messages"][-1].content
+    except Exception as e:
+        logger.error(f"[CODE WORKER] Agent failed: {e}")
+        content = f"Error: {e}"
+        result = {}
+
+    # Extract sources from the agent's tool calls
+    sources: list[str] = []
+    for msg in result.get("messages", []):
+        if hasattr(msg, "content") and msg.type == "tool":
+            if hasattr(msg, "name") and msg.name in ("read_file", "search_code"):
+                pass  # sources are embedded in the answer already
+
+    logger.info(f"[CODE WORKER] Done: {len(content)} chars")
+    return {"code_result": content, "code_sources": sources}
 
 
 def db_worker(state: dict) -> dict:
-    """DB worker: query schema → LLM formats."""
+    """DB worker: ReAct agent with list_tables + query_database tools."""
     task = state.get("task", "")
     logger.info(f"[DB WORKER] {task[:100]}")
 
-    from agent.tools import list_tables
-    try:
-        tables_info = list_tables.invoke({})
-    except Exception as e:
-        tables_info = f"Error: {e}"
+    from agent.tools import list_tables, describe_table, query_database, _get_query_dsn
 
-    result = _llm_summarize(
-        system="You are a database analyst. Describe the schema based on the provided table list. Use markdown tables.",
-        context=f"Tables:\n{tables_info[:10000]}",
-        task=task,
+    dsn = _get_query_dsn()
+    if not dsn:
+        return {"db_result": "Error: No project database configured. Use `db <dsn>` in Slack to set the database connection."}
+
+    from langchain.agents import create_agent
+
+    agent = create_agent(
+        model=_worker_model,
+        tools=[list_tables, describe_table, query_database],
+        system_prompt=(
+            "You are a database analyst for a PostgreSQL database.\n"
+            "Workflow:\n"
+            "1. Start by calling `list_tables` to see all table names.\n"
+            "2. Use `describe_table('<name>')` to see full columns of specific tables you need.\n"
+            "3. Based on the schema, construct SELECT queries using `query_database` to gather data.\n"
+            "4. ONLY use SELECT queries. Never use INSERT, UPDATE, DELETE, DROP, ALTER, or any data modification.\n"
+            "5. Always add LIMIT 50 to queries that might return many rows.\n"
+            "5. For relationship questions, use JOIN queries.\n"
+            "6. For count/aggregation questions, use COUNT, SUM, AVG, etc.\n"
+            "7. If a query fails, adjust and retry once. If it still fails, explain the error.\n\n"
+            "Rules:\n"
+            "- Be concise. Use markdown tables for data.\n"
+            "- Answer in the same language as the user's question.\n"
+            "- If the question is ambiguous, make a reasonable assumption and state it.\n"
+            "- Maximum 3 tool calls to answer. If you can't solve it, summarize what you found."
+        ),
     )
-    logger.info(f"[DB WORKER] Done: {len(result)} chars")
-    return {"db_result": result}
+
+    try:
+        result = agent.invoke({"messages": [("user", task)]}, config={"recursion_limit": 15})
+        content = result["messages"][-1].content
+    except Exception as e:
+        logger.error(f"[DB WORKER] Agent failed: {e}")
+        content = f"Error: {e}"
+
+    logger.info(f"[DB WORKER] Done: {len(content)} chars")
+    return {"db_result": content}
 
 
 def web_worker(state: dict) -> dict:

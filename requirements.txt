@@ -3,6 +3,7 @@ langgraph
 langchain
 langchain-core
 langchain-text-splitters
+pymysql
 
 # LLM Providers
 langchain-openai

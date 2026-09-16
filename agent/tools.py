@@ -20,6 +20,8 @@ CODE_BASE_DIR = Path(os.getenv("LOOM_CODE_DIR", "."))
 
 # Active project (switchable at runtime)
 _active_project: Path | None = None
+# Active project database DSN (separate from Loom's infrastructure DB)
+_project_db_dsn: str = os.getenv("LOOM_PROJECT_DB_DSN", "")
 
 
 def _get_project_dir() -> Path:
@@ -27,6 +29,33 @@ def _get_project_dir() -> Path:
     if _active_project and _active_project.exists():
         return _active_project
     return CODE_BASE_DIR
+
+
+def get_project_db_dsn() -> str:
+    """Return the project database DSN (empty if not set)."""
+    return _project_db_dsn
+
+
+def set_project_db_dsn(dsn: str) -> str:
+    """Set the project database DSN at runtime."""
+    global _project_db_dsn
+    _project_db_dsn = dsn
+    return f"Project database set: {dsn.split('@')[-1] if '@' in dsn else dsn}"
+
+
+def _get_query_dsn() -> str:
+    """Get the DSN to use for project DB queries.
+
+    If a project DB DSN is set, use it. Otherwise, if no project is active,
+    fall back to Loom's infra DSN. If a project IS active but no project DSN,
+    return empty (to avoid accidentally querying Loom's own tables).
+    """
+    if _project_db_dsn:
+        return _project_db_dsn
+    if _active_project:
+        return ""  # Project active but no DB configured — refuse
+    from agent.config import _pg_dsn
+    return _pg_dsn
 
 
 def get_active_collection() -> str:
@@ -441,7 +470,7 @@ def list_projects() -> str:
 def query_database(sql: str) -> str:
     """Run a SQL query against the project's PostgreSQL database.
 
-    Only SELECT queries are allowed. Returns results as a formatted table.
+    Only SELECT queries are allowed. Results are limited to 10 rows.
 
     Args:
         sql: SQL query to execute (SELECT only)
@@ -453,30 +482,55 @@ def query_database(sql: str) -> str:
     if not stripped.startswith("SELECT") and not stripped.startswith("WITH"):
         return "Error: Only SELECT queries are allowed."
     # Block dangerous keywords
-    dangerous = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE", "GRANT", "REVOKE"]
+    dangerous = [
+        "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE",
+        "TRUNCATE", "GRANT", "REVOKE", "INTO",
+        "FOR UPDATE", "FOR SHARE", "FOR NO KEY UPDATE",
+    ]
     for kw in dangerous:
         if _re.search(rf"\b{kw}\b", stripped):
-            return f"Error: '{kw}' is not allowed. Only SELECT queries."
+            return f"Error: '{kw}' is not allowed. Only read-only SELECT queries."
+    # Block dangerous PostgreSQL functions
+    dangerous_funcs = [
+        "pg_terminate_backend", "pg_cancel_backend",
+        "lo_import", "lo_export", "pg_read_file", "pg_read_binary_file",
+        "pg_terminate", "dblink", "dblink_connect",
+        "pg_reload_conf", "pg_rotate_logfile",
+        "pg_ls_dir", "pg_stat_file",
+    ]
+    for func in dangerous_funcs:
+        if func.upper() in stripped:
+            return f"Error: Function '{func}' is not allowed."
+    # Block COPY, EXECUTE, SET, DO, VACUUM, REINDEX, CLUSTER
+    blocked_cmds = ["COPY", "EXECUTE", "SET ", "DO $$", "VACUUM", "REINDEX", "CLUSTER", "REFRESH"]
+    for cmd in blocked_cmds:
+        if stripped.startswith(cmd):
+            return f"Error: '{cmd.strip()}' is not allowed."
 
-    from agent.config import _pg_dsn
-    if not _pg_dsn:
-        return "Error: No database connection configured (RAG_PG_DSN not set)."
+    dsn = _get_query_dsn()
+    if not dsn:
+        return "Error: No project database configured. Use `db <dsn>` to set it."
 
     import psycopg
 
     try:
-        conn = psycopg.connect(_pg_dsn, autocommit=True)
+        conn = psycopg.connect(dsn, autocommit=True, connect_timeout=5)
         cur = conn.cursor()
+        # Set statement timeout to 30 seconds
+        cur.execute("SET statement_timeout = 30000")
+        # Add LIMIT if not present
+        if "LIMIT" not in stripped:
+            sql = sql.rstrip().rstrip(";") + " LIMIT 1000"
         cur.execute(sql)
-        rows = cur.fetchall()
+        rows = cur.fetchmany(10)  # Fetch at most 10 rows
         cols = [desc[0] for desc in cur.description] if cur.description else []
+        total_estimate = len(rows)
         conn.close()
 
         if not rows:
             return "Query returned 0 rows."
 
-        limit = 10
-        shown = rows[:limit]
+        shown = rows
 
         # Format as table
         max_widths = [len(c) for c in cols]
@@ -507,14 +561,14 @@ def list_tables() -> str:
     Returns:
         List of tables with column names and types.
     """
-    from agent.config import _pg_dsn
-    if not _pg_dsn:
-        return "Error: No database connection configured."
+    dsn = _get_query_dsn()
+    if not dsn:
+        return "Error: No project database configured. Use `db <dsn>` in Slack to set it."
 
     import psycopg
 
     try:
-        conn = psycopg.connect(_pg_dsn, autocommit=True)
+        conn = psycopg.connect(dsn, autocommit=True)
         cur = conn.cursor()
         cur.execute("""
             SELECT table_name, column_name, data_type
@@ -528,15 +582,82 @@ def list_tables() -> str:
         if not rows:
             return "No tables found in 'public' schema."
 
+        # Full: all tables with all columns (max 500 tables)
         tables: dict[str, list[str]] = {}
         for table, col, dtype in rows:
             tables.setdefault(table, []).append(f"  {col} ({dtype})")
 
-        result = []
-        for table, cols in sorted(tables.items()):
-            result.append(f"📋 {table}:")
-            result.extend(cols)
+        total_tables = len(tables)
+        total_cols = len(rows)
+        max_tables = 500
+
+        result = [f"Database: {total_tables} tables, {total_cols} columns total"]
+        result.append("")
+
+        shown = 0
+        for table in sorted(tables.keys()):
+            if shown >= max_tables:
+                break
+            shown += 1
+            result.append(f"📋 {table} ({len(tables[table])} cols):")
+            result.extend(tables[table])
             result.append("")
+
+        if shown < total_tables:
+            result.append(f"... {total_tables - shown} more tables not shown")
+            result.append("Use `describe_table('<name>')` for specific tables.")
+
+        return "\n".join(result)
+
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@tool(parse_docstring=True)
+def describe_table(table_name: str) -> str:
+    """Show full column details for a specific table.
+
+    Args:
+        table_name: Name of the table to describe
+    """
+    dsn = _get_query_dsn()
+    if not dsn:
+        return "Error: No project database configured. Use `db <dsn>` in Slack to set it."
+
+    import psycopg
+
+    try:
+        conn = psycopg.connect(dsn, autocommit=True)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT column_name, data_type, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s
+            ORDER BY ordinal_position
+        """, (table_name,))
+        rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            return f"Table '{table_name}' not found in 'public' schema."
+
+        result = [f"📋 {table_name} ({len(rows)} columns):"]
+        for col, dtype, nullable, default in rows:
+            null_mark = "" if nullable == "NO" else "?"
+            default_str = f" = {default}" if default else ""
+            result.append(f"  {col}{null_mark} ({dtype}){default_str}")
+
+        # Also get row count estimate
+        try:
+            conn = psycopg.connect(dsn, autocommit=True)
+            cur = conn.cursor()
+            cur.execute(f"SELECT COUNT(*) FROM \"{table_name}\"")
+            count = cur.fetchone()[0]
+            conn.close()
+            result.append(f"\n📊 Approx rows: {count:,}")
+        except Exception:
+            pass
+
         return "\n".join(result)
 
     except Exception as e:

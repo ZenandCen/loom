@@ -72,11 +72,8 @@ class TeamOutput(BaseModel):
     total_chars: int = Field(default=0, description="Total output size")
 
     def to_slack_text(self) -> str:
-        """Format output for Slack (max 4000 chars)."""
+        """Format output for Slack. Long messages are auto-split by SlackBot."""
         parts = [self.synthesis]
         if self.diagram:
             parts.append(f"\n\n```mermaid\n{self.diagram}\n```")
-        text = "\n".join(parts)
-        if len(text) > 4000:
-            text = text[:3997] + "..."
-        return text
+        return "\n".join(parts)
