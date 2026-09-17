@@ -5,6 +5,10 @@ WORKDIR /app
 # System deps
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
     curl \
+    tesseract-ocr \
+    tesseract-ocr-vie \
+    poppler-utils \
+    libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Python deps

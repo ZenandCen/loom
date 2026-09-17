@@ -107,6 +107,147 @@ def retrieve_with_parents(
     )
 
 
+def discover_projects(
+    query: str,
+    collections: list[str],
+    k: int = 1,
+) -> list[tuple[str, float]]:
+    """Probe each collection with the query and rank by relevance.
+
+    Free-mode (rag_kb "homepage") discovery: instead of "list all collections",
+    we let VECTOR similarity decide which projects are actually relevant to the
+    user's input. E.g. query "các project DWH" surfaces the fpt_dwh_* collections
+    near the top rather than everything.
+
+    Args:
+        query: The user's question (embedded and compared against each collection).
+        collections: Collection (project) names to probe.
+        k: Number of hits to sample per collection (only the top hit scores it).
+
+    Returns:
+        List of (collection_name, relevance) sorted by relevance (desc). Relevance
+        is a 0..1-ish value derived from the top hit's vector distance; it is used
+        only for ranking/display in the human-in-the-loop prompt, never as a hard gate.
+    """
+    from rag.indexing import get_vectorstore
+
+    scored: list[tuple[str, float]] = []
+    for col in collections:
+        try:
+            vs = get_vectorstore(col)
+            hits = vs.similarity_search_with_score(query, k=k)
+            if hits:
+                _doc, dist = hits[0]
+                # pgvector returns a distance (lower = more similar). Normalise to a
+                # 0..1-ish relevance for ranking. Clamp negatives to 0.
+                rel = max(0.0, 1.0 - float(dist))
+                scored.append((col, rel))
+            else:
+                scored.append((col, 0.0))
+        except Exception as e:
+            logger.warning(f"discover_projects: probe failed for '{col}': {e}")
+            scored.append((col, 0.0))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored
+
+
+def retrieve_across_collections(
+    query: str,
+    collections: list[str],
+    k_per_collection: int = 4,
+    max_total: int = 20,
+    parent_max_chars: int = 4000,
+) -> "ParentRetrievalResult":
+    """Search multiple collections, expand parents, and group context by project.
+
+    Free-mode (rag_kb "homepage") retrieval: pulls the top-k_per_collection hits from
+    EACH requested collection (so every confirmed project is represented), expands each
+    hit to its full parent, and groups the context under a per-project header so the LLM
+    can attribute evidence to its project and analyse cross-project relationships.
+
+    Collections should be passed in relevance order (from discover_projects) so the most
+    relevant projects get full representation when max_total is reached.
+
+    Args:
+        query: The user's question.
+        collections: The (confirmed) collection names to search.
+        k_per_collection: Child chunks to pull per collection.
+        max_total: Cap on total chunk blocks across all collections.
+        parent_max_chars: Safety limit per expanded parent.
+
+    Returns:
+        ParentRetrievalResult with hits, per-project context_blocks, and sources.
+    """
+    from pathlib import Path
+
+    from rag.indexing import get_vectorstore
+    from rag.parents import fetch_parents
+    from rag.schemas import ParentRetrievalResult, RetrievalHit
+
+    collections = list(dict.fromkeys(collections))  # dedupe, keep order
+    hits: list[RetrievalHit] = []
+    context_blocks: list[str] = []
+    sources: list[str] = []
+    idx = 0
+
+    for col in collections:
+        if idx >= max_total:
+            break
+        try:
+            vs = get_vectorstore(col)
+            results = vs.similarity_search(query, k=k_per_collection)
+        except Exception as e:
+            logger.warning(f"retrieve_across_collections: search failed for '{col}': {e}")
+            continue
+        if not results:
+            continue
+
+        # Expand this collection's hits to their parents (per-collection fetch is safe
+        # and does not rely on parent-id uniqueness across collections).
+        parent_ids = [d.metadata.get("parent_id") for d in results if d.metadata.get("parent_id")]
+        parent_map: dict[str, str] = {}
+        if parent_ids:
+            for p in fetch_parents(parent_ids, collection=col):
+                parent_map[p.id] = p.content[:parent_max_chars]
+
+        col_blocks: list[str] = []
+        for d in results:
+            if idx >= max_total:
+                break
+            idx += 1
+            src = d.metadata.get("source", "?")
+            fname = Path(src).name
+            ftype = d.metadata.get("type", "?")
+            extra = ""
+            if d.metadata.get("class"):
+                fn = d.metadata.get("function", "")
+                extra = f" [{d.metadata['class']}.{fn}]" if fn else f" [{d.metadata['class']}]"
+            parent_content = parent_map.get(d.metadata.get("parent_id", ""), "")
+            block = f"[{idx}] ({ftype}) {fname}{extra}"
+            if parent_content:
+                block += f"\n\n--- Full context ---\n{parent_content}"
+            block += f"\n\n--- Relevant section ---\n{d.page_content}"
+            col_blocks.append(block)
+            hits.append(RetrievalHit(
+                content=d.page_content,
+                source=src,
+                file_type=ftype,
+                parent_content=parent_content if parent_content else None,
+            ))
+            if fname not in sources:
+                sources.append(fname)
+
+        if col_blocks:
+            context_blocks.append(f"## Project: {col}")
+            context_blocks.extend(col_blocks)
+
+    logger.info(
+        f"retrieve_across_collections: {len(collections)} collections → "
+        f"{len(hits)} hits from {len(sources)} files"
+    )
+    return ParentRetrievalResult(hits=hits, context_blocks=context_blocks, sources=sources)
+
+
 def get_retriever(collection_name: Optional[str] = None, k: Optional[int] = None):
     """Create a vector similarity retriever from the configured store.
 

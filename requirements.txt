@@ -50,6 +50,11 @@ httpx
 # MCP
 mcp
 
+# OCR / Vision
+pytesseract
+pdf2image
+Pillow
+
 # Utils
 python-dotenv
 pydantic

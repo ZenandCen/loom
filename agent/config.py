@@ -53,11 +53,42 @@ from utils.models import LLM, get_llm  # noqa: F401
 # --- Memory Infrastructure ---
 # Checkpointer: per-session state (persistent via Postgres connection pool)
 _pg_dsn = os.getenv("RAG_PG_DSN", "")
+
+# PostgresSaver in the installed langgraph-checkpoint-postgres only implements
+# sync methods; its async methods (aget_tuple, aput, ...) raise NotImplementedError.
+# Since the team graph nodes are async-only (must use ainvoke), we subclass and
+# bridge the async methods to the working sync ones via a thread pool.
+import asyncio
+from langgraph.checkpoint.postgres import PostgresSaver
+
+
+class AsyncPostgresSaver(PostgresSaver):
+    """PostgresSaver with async methods bridged to sync implementations."""
+
+    async def aget_tuple(self, config):
+        return await asyncio.to_thread(self.get_tuple, config)
+
+    async def alist(self, config, *, filter=None, before=None, limit=None):
+        results = await asyncio.to_thread(
+            list, self.list(config, filter=filter, before=before, limit=limit)
+        )
+        for item in results:
+            yield item
+
+    async def aput(self, config, checkpoint, metadata, new_versions):
+        return await asyncio.to_thread(self.put, config, checkpoint, metadata, new_versions)
+
+    async def aput_writes(self, config, writes, task_id, task_path=""):
+        return await asyncio.to_thread(self.put_writes, config, writes, task_id, task_path)
+
+    async def adelete_thread(self, thread_id):
+        return await asyncio.to_thread(self.delete_thread, thread_id)
+
+
 try:
     if _pg_dsn:
         import psycopg
         from psycopg_pool import ConnectionPool
-        from langgraph.checkpoint.postgres import PostgresSaver
 
         # Run DDL setup with autocommit (CREATE INDEX CONCURRENTLY requires it)
         _setup_conn = psycopg.connect(_pg_dsn, autocommit=True)
@@ -111,8 +142,8 @@ try:
 
         # Use pool for runtime operations
         _pg_pool = ConnectionPool(_pg_dsn, open=True, min_size=1, max_size=5)
-        checkpointer = PostgresSaver(_pg_pool)
-        print(f"  [CHECKPOINTER] PostgresSaver (pool) ready")
+        checkpointer = AsyncPostgresSaver(_pg_pool)
+        print(f"  [CHECKPOINTER] AsyncPostgresSaver (pool) ready")
     else:
         from langgraph.checkpoint.memory import MemorySaver
         checkpointer = MemorySaver()

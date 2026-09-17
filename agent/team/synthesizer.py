@@ -5,11 +5,12 @@ import re
 
 from agent.team.state import TeamState
 from agent.team.schemas import TeamOutput, WorkerResult, WorkerName, WorkerStatus, DiagramType
-from utils.models import LLM, get_llm
+from utils.models import LLM, get_llm, get_backbone_llm
 
 logger = logging.getLogger(__name__)
 
-_synth_model = get_llm(LLM.OPENAI)
+# Backbone answer model with automatic fallback: qwen -> gemini -> gemma(local).
+_synth_model = get_backbone_llm()
 
 SYNTH_PROMPT = """\
 You are a synthesis engine. Combine results from multiple specialist workers into ONE coherent answer.
@@ -55,6 +56,7 @@ def _classify_diagram(diagram: str) -> DiagramType:
 def synthesize_node(state: TeamState) -> dict:
     """Combine all worker results into final synthesis."""
     query = state.get("user_query", "")
+    history = state.get("history", "")
     results = {}
     for key, label in [
         ("rag_result", "Document Analysis"),
@@ -67,17 +69,54 @@ def synthesize_node(state: TeamState) -> dict:
             results[label] = val
 
     if not results:
-        return {"synthesis": "No worker results to synthesize. The task may not have required any workers."}
+        # No workers dispatched — answer directly (greeting, chit-chat, simple Q&A,
+        # or a request the planner decided needs no tools).
+        history_block = f"\n\nPrevious conversation:\n{history}" if history else ""
+        direct_prompt = (
+            "You are a friendly, helpful AI assistant. Respond directly to the user's message.\n"
+            "CRITICAL: If the user asked a real question, you MUST answer it directly using your own knowledge. "
+            "NEVER reply with a greeting like 'Hi, how can I help?' when a genuine question is present.\n"
+            "- If it is ONLY a greeting or thanks (no real question), respond warmly in one sentence.\n"
+            "- If it is a question, answer it concisely but completely — give the actual information, not a deflection.\n"
+            "- If the request is genuinely unclear, ask ONE short clarifying question.\n"
+            "- Match the user's language (Vietnamese if they write in Vietnamese).\n"
+            f"- Be concise unless the user asks for detail.{history_block}\n\n"
+            f"User: {query}\n\nAssistant:"
+        )
+        try:
+            response = _synth_model.invoke([
+                {"role": "system", "content": "You are a friendly, concise AI assistant."},
+                {"role": "user", "content": direct_prompt},
+            ])
+            synthesis = response.content if isinstance(response.content, str) else str(response.content)
+            synthesis = synthesis.strip()
+            if not synthesis:
+                return {"synthesis": "Mình ở đây để hỗ trợ! Bạn muốn hỏi gì?"}
+            logger.info(f"[SYNTH] Direct response (no workers): {len(synthesis)} chars")
+            return {"synthesis": synthesis}
+        except Exception as e:
+            logger.warning(f"Direct response failed, using fallback: {e}")
+            return {"synthesis": "Mình ở đây để hỗ trợ! Bạn muốn hỏi gì?"}
 
     sections = []
     for label, content in results.items():
         sections.append(f"## {label}\n{content}")
     combined = "\n\n".join(sections)
 
+    # Free mode (no project, rag_kb): bias toward combining RAG + web, and favor
+    # modern, minimal-change, low-risk solutions that don't casually restructure.
+    bias = ""
+    if not state.get("project", ""):
+        bias = (
+            "\n\nLưu ý (chế độ chung / rag_kb): tổng hợp cả ngữ cảnh nội bộ (RAG) và nghiên cứu web thành MỘT phương án nhất quán. "
+            "Đề xuất giải pháp HIỆN ĐẠI, TỐI GIẢN, ÍT đập code, an toàn; KHÔNG tự ý thay đổi cấu trúc DB hay kiến trúc hiện có. "
+            "Ưu tiên phương án ít thay đổi nhất, dễ triển khai và dễ rollback nhất."
+        )
+
     prompt = (
         f"User asked: {query}\n\n"
         f"Worker results:\n\n{combined}\n\n"
-        f"Now synthesize into ONE coherent answer for the user:"
+        f"Now synthesize into ONE coherent answer for the user:{bias}"
     )
 
     response = _synth_model.invoke([

@@ -12,10 +12,13 @@ class TeamState(TypedDict, total=False):
     user_query: str
     user_id: str
     project: str
+    history: str
 
     # Planning
     plan: str
     plan_votes: dict[str, str]
+    task_votes: dict[str, str]
+    routed: list[str]
 
     # Worker results
     rag_result: str

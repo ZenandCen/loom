@@ -9,13 +9,15 @@ This avoids context bloat from multi-turn tool calling agents.
 
 import logging
 import os
+import re
 from pathlib import Path
 
-from utils.models import LLM, get_llm
+from utils.models import LLM, get_llm, get_backbone_llm
 
 logger = logging.getLogger(__name__)
 
-_worker_model = get_llm(LLM.OPENAI)
+# Backbone answer model with automatic fallback: qwen -> gemini -> gemma(local).
+_worker_model = get_backbone_llm()
 
 # Iterative summarization config
 CTX_THRESHOLD = int(os.getenv("LOOM_CTX_THRESHOLD", "30000"))
@@ -98,21 +100,16 @@ def _iterative_llm_call(system: str, context: str, task: str) -> str:
     return content.strip()
 
 
-def rag_worker(state: dict) -> dict:
-    """RAG worker: retrieve with parent expansion → LLM summarizes."""
-    task = state.get("task", "")
-    logger.info(f"[RAG WORKER] {task[:100]}")
-
-    from agent.tools import get_active_collection
-
-    collection = get_active_collection()
-    sources: list[str] = []
+def _basic_retrieve(task: str, collection: str, sources: list[str]) -> str:
+    """Single-collection retrieval with parent expansion (+ basic fallback)."""
+    from rag.retrieval import retrieve_with_parents
     try:
-        from rag.retrieval import retrieve_with_parents
         result = retrieve_with_parents(task, collection_name=collection, k=8)
         context_blocks = result.context_blocks
-        sources = result.sources
-        context = "\n\n---\n\n".join(context_blocks) if context_blocks else "(no results found)"
+        for s in result.sources:
+            if s not in sources:
+                sources.append(s)
+        return "\n\n---\n\n".join(context_blocks) if context_blocks else "(no results found)"
     except Exception as e:
         logger.warning(f"Parent retrieval failed, falling back to basic: {e}")
         from rag.indexing import get_vectorstore
@@ -125,10 +122,126 @@ def rag_worker(state: dict) -> dict:
             context_parts.append(f"[{i}] {fname}:\n{doc.page_content[:800]}")
             if fname not in sources:
                 sources.append(fname)
-        context = "\n\n---\n\n".join(context_parts) if context_parts else "(no results found)"
+        return "\n\n---\n\n".join(context_parts) if context_parts else "(no results found)"
+
+
+_CONFIRM_WORDS = {
+    "ok", "okay", "yes", "y", "yep", "confirm", "proceed", "go", "run",
+    "đồng ý", "dong y", "dongyi", "tiến hành", "tien hanh", "duyệt", "duyet", "a", "1",
+}
+_ALL_WORDS = {
+    "all", "all projects", "every project", "everything", "tất cả", "tat ca", "tatca",
+    "tất cả project", "tat ca project", "mọi project", "moi project", "toàn bộ", "toan bo",
+}
+_DECLINE_WORDS = {
+    "no", "n", "nope", "cancel", "stop", "hủy", "huy", "không", "khong", "bỏ qua", "bo qua",
+}
+
+
+def _parse_scope_decision(decision, candidate_names: list[str], all_project_names: list[str]) -> list[str]:
+    """Map the user's HITL reply to a confirmed list of collections.
+
+    - confirm (ok/yes/đồng ý...)   -> proposed candidates
+    - all (all/tất cả/...)          -> every learned project
+    - decline (no/hủy/cancel...)    -> [] (skip cross-search)
+    - explicit names                -> those matching known projects (exact or fuzzy)
+    - anything else                 -> proposed candidates (safe default)
+    """
+    if decision is None:
+        return list(candidate_names)
+    s = str(decision).strip().lower()
+    if not s:
+        return list(candidate_names)
+    if s in _CONFIRM_WORDS:
+        return list(candidate_names)
+    if s in _ALL_WORDS:
+        return list(all_project_names)
+    if s in _DECLINE_WORDS:
+        return []
+
+    tokens = [t for t in re.split(r"[,\s]+", s) if t]
+    exact = {t for t in tokens if t in {n.lower() for n in all_project_names}}
+    if exact:
+        return [n for n in all_project_names if n.lower() in exact]
+    fuzzy = [
+        n for n in all_project_names
+        if any(tok in n.lower() or n.lower() in tok for tok in tokens)
+    ]
+    if fuzzy:
+        return fuzzy
+    return list(candidate_names)
+
+
+def rag_worker(state: dict) -> dict:
+    """RAG worker: retrieve (single collection, or cross-collection in free mode) → LLM summarizes.
+
+    In free mode (rag_kb "homepage"), retrieval is query-driven across all learned
+    projects with a human-in-the-loop confirmation of which projects to fetch.
+    In project mode, it only searches that project's own collection (unchanged).
+    """
+    task = state.get("task", "")
+    logger.info(f"[RAG WORKER] {task[:100]}")
+
+    from agent.tools import get_active_collection
+    from rag.config import get_rag_settings
+
+    collection = get_active_collection()
+    default_collection = get_rag_settings().default_collection
+    free_mode = (collection == default_collection)
+
+    sources: list[str] = []
+    scope_note = ""
+    context = ""
+
+    if free_mode:
+        from rag.indexing import list_collections
+        learned = list_collections(min_count=1)
+        learned_names = [name for name, _ in learned]
+        if not learned_names:
+            context = _basic_retrieve(task, collection, sources)
+        else:
+            from rag.retrieval import discover_projects, retrieve_across_collections
+            candidates = discover_projects(task, learned_names)
+            candidate_names = [name for name, _ in candidates]
+            if not candidate_names:
+                context = "(no relevant projects found in the knowledge base)"
+            else:
+                # Human-in-the-loop: confirm which projects to fetch.
+                # NOTE: interrupt() must NOT sit inside a try/except — it pauses the graph.
+                from langgraph.types import interrupt
+                decision = interrupt({
+                    "type": "rag_scope_confirm",
+                    "candidates": candidate_names,
+                    "all_projects": learned_names,
+                    "query": task,
+                })
+                confirmed = _parse_scope_decision(decision, candidate_names, learned_names)
+                if not confirmed:
+                    context = "(User declined the cross-project search.)"
+                else:
+                    try:
+                        scope_note = "Projects searched: " + ", ".join(f"`{c}`" for c in confirmed) + "."
+                        res = retrieve_across_collections(task, confirmed, k_per_collection=4, max_total=20)
+                        context = "\n\n".join(res.context_blocks) if res.context_blocks else "(no matching content found in the selected projects)"
+                        for s in res.sources:
+                            if s not in sources:
+                                sources.append(s)
+                    except Exception as e:
+                        logger.warning(f"Cross-collection retrieval failed: {e}")
+                        context = f"(cross-project retrieval error: {e})"
+    else:
+        context = _basic_retrieve(task, collection, sources)
+
+    if scope_note:
+        context = scope_note + "\n\n" + context
 
     result = _llm_summarize(
-        system="You are a knowledge base analyst. Answer based ONLY on the provided context. Cite sources as [1], [2]. If info is missing, say so.",
+        system=(
+            "You are a knowledge base analyst. Answer based ONLY on the provided context. Cite sources as [1], [2]. "
+            "In free mode the evidence is grouped by project under '## Project: <name>' headers — attribute facts to "
+            "their project, and when asked to list/compare projects, describe each and analyse relationships "
+            "(shared tech, dependencies, same domain, complementary). If info is missing, say so."
+        ),
         context=context,
         task=task,
     )
@@ -143,14 +256,18 @@ def code_worker(state: dict) -> dict:
     logger.info(f"[CODE WORKER] project={project} task={task[:100]}")
 
     from agent.tools import (
-        list_directory, read_file, search_code,
+        list_directory, read_file, search_code, set_project,
         CODE_BASE_DIR, _get_project_dir,
     )
     from rag.tool import rag_query
 
     if project:
         project_dir = CODE_BASE_DIR / project
-        if not project_dir.exists():
+        if project_dir.exists():
+            # The file tools resolve against the process-global active project, so
+            # sync it to the project this worker was given (avoids reading the wrong tree).
+            set_project.invoke({"path": project})
+        else:
             project_dir = _get_project_dir()
     else:
         project_dir = _get_project_dir()

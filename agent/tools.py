@@ -146,6 +146,14 @@ def set_project(path: str) -> str:
     return f"Active project set to: {project_path.name} ({project_path})"
 
 
+def reset_project() -> str:
+    """Clear the active project and its DB. Collection falls back to rag_kb (free mode)."""
+    global _active_project, _project_db_dsn
+    _active_project = None
+    _project_db_dsn = ""
+    return "Cleared project → rag_kb (free mode)."
+
+
 @tool(parse_docstring=True)
 def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
     """Read a source code file. Supports pagination for large files.

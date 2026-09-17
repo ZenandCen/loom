@@ -203,6 +203,144 @@ def get_vectorstore(collection_name: Optional[str] = None):
         )
 
 
+def collection_exists(collection_name: str) -> bool:
+    """Check if a collection already exists in the vector store."""
+    settings = get_rag_settings()
+    if settings.vector_db_type == VectorDBType.PGVECTOR:
+        try:
+            import psycopg
+            conn = psycopg.connect(settings.postgres_dsn, autocommit=True)
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM langchain_pg_collection WHERE name = %s", (collection_name,))
+            exists = cur.fetchone() is not None
+            conn.close()
+            return exists
+        except Exception:
+            return False
+    elif settings.vector_db_type == VectorDBType.CHROMA:
+        try:
+            from langchain_chroma import Chroma
+            embeddings = get_embeddings()
+            vs = Chroma(
+                persist_directory=settings.chroma_persist_dir,
+                collection_name=collection_name,
+                embedding_function=embeddings,
+            )
+            return vs._collection.count() > 0
+        except Exception:
+            return False
+    return False
+
+
+def get_collection_count(collection_name: str) -> int:
+    """Get number of embeddings in a collection."""
+    settings = get_rag_settings()
+    if settings.vector_db_type == VectorDBType.PGVECTOR:
+        try:
+            import psycopg
+            conn = psycopg.connect(settings.postgres_dsn, autocommit=True)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT COUNT(*) FROM langchain_pg_embedding e
+                JOIN langchain_pg_collection c ON e.collection_id = c.uuid
+                WHERE c.name = %s
+            """, (collection_name,))
+            count = cur.fetchone()[0]
+            conn.close()
+            return count
+        except Exception:
+            return 0
+    return 0
+
+
+def list_collections(min_count: int = 1) -> list[tuple[str, int]]:
+    """List collections that contain data, as (name, chunk_count) sorted by count desc.
+
+    Used in free mode (rag_kb "homepage") to discover which projects have been
+    learned, and to drive query-driven cross-project discovery.
+
+    Args:
+        min_count: Only return collections with at least this many chunks.
+
+    Returns:
+        List of (collection_name, chunk_count) tuples, most-chunked first.
+        Empty list if no data or the backend is unsupported.
+    """
+    settings = get_rag_settings()
+    if settings.vector_db_type == VectorDBType.PGVECTOR:
+        try:
+            import psycopg
+            conn = psycopg.connect(settings.postgres_dsn, autocommit=True)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT c.name, COUNT(e.id) AS cnt
+                FROM langchain_pg_collection c
+                LEFT JOIN langchain_pg_embedding e ON e.collection_id = c.uuid
+                GROUP BY c.name
+                HAVING COUNT(e.id) >= %s
+                ORDER BY cnt DESC
+            """, (min_count,))
+            rows = cur.fetchall()
+            conn.close()
+            return [(r[0], int(r[1])) for r in rows]
+        except Exception as e:
+            logger.warning(f"list_collections (pgvector) failed: {e}")
+            return []
+    elif settings.vector_db_type == VectorDBType.CHROMA:
+        try:
+            import chromadb
+            client = chromadb.PersistentClient(settings.chroma_persist_dir)
+            out: list[tuple[str, int]] = []
+            for c in client.list_collections():
+                name = getattr(c, "name", None) or str(c)
+                try:
+                    cnt = int(c.count())
+                except Exception:
+                    cnt = 0
+                if cnt >= min_count:
+                    out.append((name, cnt))
+            return sorted(out, key=lambda x: x[1], reverse=True)
+        except Exception as e:
+            logger.warning(f"list_collections (chroma) failed: {e}")
+            return []
+    return []
+
+
+def clear_vectorstore_collection(collection_name: str) -> int:
+    """Clear all embeddings from a collection. Returns number of rows deleted."""
+    settings = get_rag_settings()
+    if settings.vector_db_type == VectorDBType.PGVECTOR:
+        try:
+            import psycopg
+            conn = psycopg.connect(settings.postgres_dsn, autocommit=True)
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM langchain_pg_embedding WHERE collection_id = (SELECT uuid FROM langchain_pg_collection WHERE name = %s)",
+                (collection_name,),
+            )
+            deleted = cur.rowcount
+            conn.close()
+            logger.info(f"Cleared {deleted} embeddings from collection '{collection_name}'")
+            return deleted
+        except Exception as e:
+            logger.warning(f"Failed to clear collection '{collection_name}': {e}")
+            return 0
+    elif settings.vector_db_type == VectorDBType.CHROMA:
+        try:
+            from langchain_chroma import Chroma
+            embeddings = get_embeddings()
+            vs = Chroma(
+                persist_directory=settings.chroma_persist_dir,
+                collection_name=collection_name,
+                embedding_function=embeddings,
+            )
+            vs._collection.delete(where={"$ne": None})
+            return 0
+        except Exception:
+            return 0
+    return 0
+
+
 def index_documents(
     input_dir: Optional[Path] = None,
     collection_name: Optional[str] = None,

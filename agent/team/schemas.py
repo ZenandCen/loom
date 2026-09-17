@@ -17,6 +17,7 @@ class TeamInput(BaseModel):
     user_query: str = Field(..., min_length=1, description="User's question or request")
     user_id: str = Field(default="", description="Slack user ID")
     project: str = Field(default="", description="Active project name (e.g. 'fpt-dwh-reconcile-svc')")
+    history: str = Field(default="", description="Previous conversation context (last Q&A)")
 
 
 class WorkerStatus(str, Enum):
