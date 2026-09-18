@@ -38,7 +38,7 @@ def _single_llm_call(system: str, context: str, task: str) -> str:
 
     messages = [
         SystemMessage(content=system),
-        HumanMessage(content=f"Context:\n{context}\n\nTask: {task}\n\nAnswer concisely with references."),
+        HumanMessage(content=f"Context:\n{context}\n\nTask: {task}\n\nAnswer comprehensively with specific references. Include all relevant details, names, and specifics from the context. Do NOT be brief."),
     ]
     response = _worker_model.invoke(messages)
     content = response.content
@@ -92,7 +92,7 @@ def _iterative_llm_call(system: str, context: str, task: str) -> str:
     combined = "\n\n---\n\n".join(f"[{i+1}] {s}" for i, s in enumerate(summaries))
     response = _worker_model.invoke([
         SystemMessage(content=system),
-        HumanMessage(content=f"Summarized context:\n{combined}\n\nTask: {task}\n\nAnswer concisely with references."),
+        HumanMessage(content=f"Summarized context:\n{combined}\n\nTask: {task}\n\nAnswer comprehensively with specific references. Include all relevant details, names, and specifics. Do NOT be brief."),
     ])
     content = response.content
     if isinstance(content, list):
@@ -104,7 +104,7 @@ def _basic_retrieve(task: str, collection: str, sources: list[str]) -> str:
     """Single-collection retrieval with parent expansion (+ basic fallback)."""
     from rag.retrieval import retrieve_with_parents
     try:
-        result = retrieve_with_parents(task, collection_name=collection, k=8)
+        result = retrieve_with_parents(task, collection_name=collection, k=15)
         context_blocks = result.context_blocks
         for s in result.sources:
             if s not in sources:
@@ -114,7 +114,7 @@ def _basic_retrieve(task: str, collection: str, sources: list[str]) -> str:
         logger.warning(f"Parent retrieval failed, falling back to basic: {e}")
         from rag.indexing import get_vectorstore
         vs = get_vectorstore(collection)
-        results = vs.similarity_search(task, k=8)
+        results = vs.similarity_search(task, k=15)
         context_parts = []
         for i, doc in enumerate(results, 1):
             src = doc.metadata.get("source", "?")
@@ -221,7 +221,7 @@ def rag_worker(state: dict) -> dict:
                 else:
                     try:
                         scope_note = "Projects searched: " + ", ".join(f"`{c}`" for c in confirmed) + "."
-                        res = retrieve_across_collections(task, confirmed, k_per_collection=4, max_total=20)
+                        res = retrieve_across_collections(task, confirmed, k_per_collection=8, max_total=40)
                         context = "\n\n".join(res.context_blocks) if res.context_blocks else "(no matching content found in the selected projects)"
                         for s in res.sources:
                             if s not in sources:
@@ -240,7 +240,15 @@ def rag_worker(state: dict) -> dict:
             "You are a knowledge base analyst. Answer based ONLY on the provided context. Cite sources as [1], [2]. "
             "In free mode the evidence is grouped by project under '## Project: <name>' headers — attribute facts to "
             "their project, and when asked to list/compare projects, describe each and analyse relationships "
-            "(shared tech, dependencies, same domain, complementary). If info is missing, say so."
+            "(shared tech, dependencies, same domain, complementary).\n"
+            "CRITICAL RULES:\n"
+            "- Be Exhaustive: Include ALL relevant details from the context. Do not summarize away specifics.\n"
+            "- Be Specific: Name exact file names, function names, table names, config keys, technology choices.\n"
+            "- Holistic View: Show how pieces connect. When describing a project's architecture, show the data flow between components.\n"
+            "- Architecture Awareness: Respect and reference the EXISTING patterns in the documents. Do not suggest patterns that contradict what's documented.\n"
+            "- If comparing projects: use a table with columns for each dimension (tech stack, architecture, data model, integrations, purpose).\n"
+            "- If info is missing, say exactly WHAT is missing (not just 'info not found').\n"
+            "- End with '## Key Takeaways' (3-5 bullets) and '## Suggested Next Steps' (2-3 items)."
         ),
         context=context,
         task=task,
@@ -278,21 +286,27 @@ def code_worker(state: dict) -> dict:
         model=_worker_model,
         tools=[list_directory, read_file, search_code, rag_query],
         system_prompt=(
-            f"You are a code architect analyzing the project: {project_dir.name}\n"
+            f"You are a senior code architect analyzing the project: {project_dir.name}\n\n"
             "Workflow:\n"
-            "1. Start with `list_directory` to understand the project structure.\n"
+            "1. Start with `list_directory` to understand the project structure and architecture.\n"
             "2. Use `search_code` to find relevant functions, classes, or patterns.\n"
             "3. Use `read_file` to examine specific files (use start_line/end_line for large files).\n"
             "4. Use `rag_query` for semantic search when you don't know which file to look at.\n"
-            "5. Follow imports and dependencies: if a file references another module, read that too.\n\n"
-            "Rules:\n"
-            "- Maximum 6 tool calls. Prioritize the most important files.\n"
+            "5. Follow imports and dependencies: if a file references another module, read that too.\n"
+            "6. Trace callers: when you find a function/class, search for who uses it.\n\n"
+            "CRITICAL RULES:\n"
+            "- Architecture First: Understand the EXISTING architecture before answering. Identify the project's design patterns, layer structure, and data flow. Do NOT introduce new flow types or patterns that don't exist in the codebase.\n"
+            "- Reuse Before Creating: Always search for existing utilities, helpers, and patterns before suggesting new code. If a similar function exists, reference it. A small duplicate beats a wrong abstraction.\n"
+            "- Holistic View: Show how the code integrates with the broader system. Trace dependencies upstream and downstream. Don't just describe isolated files — explain how they connect.\n"
+            "- Follow Existing Conventions: Match the project's naming, structure, and coding style. If the project uses a specific pattern (e.g., repository pattern, service layer), follow it.\n"
+            "- Be Specific: Name exact files, functions, classes, line numbers. Never use vague references like 'the service layer' without naming the actual file.\n"
+            "- Maximum 8 tool calls. Prioritize the most important files.\n"
             "- Always reference file:line in your answer.\n"
-            "- For architecture questions, focus on entry points, key abstractions, and data flow.\n"
-            "- For 'how does X work' questions, trace the code path step by step.\n"
-            "- Be structured: use headings, bullet points, and code snippets.\n"
-            "- Answer in the same language as the user's question.\n"
-            "- If the codebase is large, focus on the most relevant 3-5 files."
+            "- For architecture questions: map entry points → key abstractions → data flow → external dependencies.\n"
+            "- For 'how does X work' questions: trace the code path step by step with file:line references.\n"
+            "- Be structured: use headings (##, ###), bullet points, code snippets, and tables where appropriate.\n"
+            "- End with a '## Key Takeaways' section (3-5 bullet points) and '## Suggested Next Steps' (2-3 items).\n"
+            "- Answer in the same language as the user's question."
         ),
     )
 
@@ -332,21 +346,27 @@ def db_worker(state: dict) -> dict:
         model=_worker_model,
         tools=[list_tables, describe_table, query_database],
         system_prompt=(
-            "You are a database analyst for a PostgreSQL database.\n"
+            "You are a senior database analyst for a PostgreSQL database.\n"
             "Workflow:\n"
             "1. Start by calling `list_tables` to see all table names.\n"
             "2. Use `describe_table('<name>')` to see full columns of specific tables you need.\n"
             "3. Based on the schema, construct SELECT queries using `query_database` to gather data.\n"
             "4. ONLY use SELECT queries. Never use INSERT, UPDATE, DELETE, DROP, ALTER, or any data modification.\n"
             "5. Always add LIMIT 50 to queries that might return many rows.\n"
-            "5. For relationship questions, use JOIN queries.\n"
-            "6. For count/aggregation questions, use COUNT, SUM, AVG, etc.\n"
-            "7. If a query fails, adjust and retry once. If it still fails, explain the error.\n\n"
-            "Rules:\n"
-            "- Be concise. Use markdown tables for data.\n"
+            "6. For relationship questions, use JOIN queries and explain the relationship (1:1, 1:N, M:N).\n"
+            "7. For count/aggregation questions, use COUNT, SUM, AVG, etc.\n"
+            "8. If a query fails, adjust and retry once. If it still fails, explain the error.\n\n"
+            "CRITICAL RULES:\n"
+            "- Architecture First: Understand the SCHEMA before answering. Identify entity relationships, normalization patterns, and data flow.\n"
+            "- Holistic View: Show how tables CONNECT. When describing a table, mention its foreign keys and what they reference. Don't describe tables in isolation.\n"
+            "- Be Exhaustive: Include ALL relevant tables, columns, constraints, and relationships. If there are 5 related tables, describe ALL 5.\n"
+            "- Be Specific: Name exact column types, constraints (PK, FK, UNIQUE, NOT NULL), and indexes. Never say 'several columns' — list them.\n"
+            "- Data Quality: Note any NULL values, default values, or unusual data patterns you observe.\n"
+            "- Use markdown tables for schema descriptions. Show actual data samples (first 3-5 rows) when relevant.\n"
+            "- End with '## Key Takeaways' (3-5 bullets) and '## Suggested Next Steps' (2-3 items).\n"
             "- Answer in the same language as the user's question.\n"
-            "- If the question is ambiguous, make a reasonable assumption and state it.\n"
-            "- Maximum 3 tool calls to answer. If you can't solve it, summarize what you found."
+            "- If the question is ambiguous, make a reasonable assumption and state it explicitly.\n"
+            "- Maximum 7 tool calls. Prioritize the most important tables."
         ),
     )
 
@@ -373,7 +393,7 @@ def web_worker(state: dict) -> dict:
         search_results = f"Search error: {e}"
 
     result = _llm_summarize(
-        system="You are a web research analyst. Summarize findings with source URLs. Be concise.",
+        system="You are a web research analyst. Summarize findings comprehensively with source URLs. Include all relevant details, specific facts, numbers, and names. Do NOT be brief.",
         context=str(search_results)[:15000],
         task=task,
     )

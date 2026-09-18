@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(os.getenv("RAG_DATA_DIR", "./data"))
 DATA_DIR.mkdir(exist_ok=True)
 
+storage = MinIOStorage()
+
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Loom Multi-Agent", version="0.1.0")
@@ -30,9 +32,6 @@ def create_app() -> FastAPI:
     @app.get("/health")
     def health():
         return {"status": "ok", "service": "loom"}
-
-    # Initialize storage
-    storage = MinIOStorage()
 
     # Initialize memory store
     try:

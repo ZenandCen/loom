@@ -84,6 +84,47 @@ async def _classify_file_for_collection(content_preview: str, collections: list[
         return "rag_kb"
 
 
+async def _classify_files_batch(files: list[dict], collections: list[tuple[str, int]]) -> list[str]:
+    """Classify multiple files at once. Returns list of suggested collection names (same order as files)."""
+    from utils.models import get_backbone_llm
+    coll_list = "\n".join(f"- {name} ({count} chunks)" for name, count in collections)
+
+    file_previews = []
+    for i, f in enumerate(files):
+        preview = f["documents"][0].page_content[:500] if f["documents"] else "(empty)"
+        file_previews.append(f"File {i+1}: {f['filename']}\nPreview:\n\"\"\"\n{preview}\n\"\"\"")
+
+    prompt = (
+        f"Given these files and available project collections, classify each file into the most appropriate collection.\n\n"
+        f"Collections:\n{coll_list}\n\n"
+        + "\n\n---\n\n".join(file_previews)
+        + f"\n\nFor EACH file, reply with just the collection name (one per line, in order).\n"
+        f"If a file doesn't clearly belong to any project, use 'rag_kb'."
+    )
+    try:
+        llm = get_backbone_llm()
+        resp = await llm.ainvoke([
+            ("system", "You are a file classifier. Reply with one collection name per line, in order. No explanations."),
+            ("human", prompt),
+        ])
+        lines = [l.strip() for l in resp.content.strip().split("\n") if l.strip()]
+        valid = {name.lower() for name, _ in collections} | {"rag_kb"}
+        suggestions = []
+        for line in lines:
+            cleaned = line.split(":")[-1].strip().lower().replace("-", "_").replace(" ", "_")
+            # Remove leading numbers/bullets
+            import re
+            cleaned = re.sub(r"^[\d\.\-\*\s]+", "", cleaned)
+            suggestions.append(cleaned if cleaned in valid else "rag_kb")
+        # Pad if LLM returned fewer lines than files
+        while len(suggestions) < len(files):
+            suggestions.append("rag_kb")
+        return suggestions[:len(files)]
+    except Exception as e:
+        logger.warning(f"Batch classification failed: {e}, defaulting to rag_kb")
+        return ["rag_kb"] * len(files)
+
+
 def _load_thread_history(thread_id: str) -> list:
     """Load full message history from checkpoint_writes for a given thread."""
     try:
@@ -1691,78 +1732,86 @@ async def process_message(
 
     # === END COMMAND ROUTER ===
 
-    # ── File Import Collection Choice ──
-    # Clean up expired pending file imports
+    # ── File Import Collection Choice (Batch) ──
     _now = time.time()
     for _k in [k for k, v in _pending_file_imports.items() if _now - v["timestamp"] > _FILE_IMPORT_TTL]:
         _pending_file_imports.pop(_k, None)
 
-    if thread_ts and thread_ts in _pending_file_imports:
+    if user_id in _pending_file_imports:
         from rag.config import get_rag_settings as _grs2
-        pending = _pending_file_imports.pop(thread_ts)
+        from rag.chunking import ChunkingConfig as _CC, chunk_documents_with_parents as _cdwp
+        from rag.indexing import get_vectorstore as _gvs
+        pending = _pending_file_imports.pop(user_id)
+        thread_ts = pending.get("thread_ts") or thread_ts
+        default_coll = _grs2().default_collection
+
         if _now - pending["timestamp"] > _FILE_IMPORT_TTL:
-            target_collection = _grs2().default_collection
+            # Expired → all into default
+            assignments = [default_coll] * len(pending["files"])
         else:
             stripped = msg.strip()
-            options = pending["options"]
-            target_collection = None
-            if stripped.isdigit() and 1 <= int(stripped) <= len(options):
-                target_collection = options[int(stripped) - 1][0]
-            else:
-                lowered = stripped.lower().replace("-", "_").replace(" ", "_")
-                for name, _ in options:
+            options = pending["options"]  # list[str]
+            suggestions = pending["suggestions"]  # list[str], one per file
+            n_files = len(pending["files"])
+
+            # Parse: "all" | "all: name" | "1: name, 2: name" | single number | single name
+            def _resolve_name(name_str: str) -> str:
+                lowered = name_str.strip().lower().replace("-", "_").replace(" ", "_")
+                for name in options:
                     if name.lower() == lowered:
-                        target_collection = name
-                        break
-                if not target_collection:
-                    for name, _ in options:
-                        if lowered in name.lower() or name.lower() in lowered:
-                            target_collection = name
-                            break
-            if not target_collection:
-                target_collection = _grs2().default_collection
+                        return name
+                for name in options:
+                    if lowered in name.lower() or name.lower() in lowered:
+                        return name
+                return default_coll
 
-        # Re-read from MinIO, OCR, chunk, index
-        try:
-            from api.server import storage
-            from rag.ocr import process_file as _ocr_pf
-            from rag.chunking import ChunkingConfig as _CC, chunk_documents_with_parents as _cdwp
-            from rag.indexing import get_vectorstore as _gvs
-            from rag.config import get_rag_settings as _grs
-
-            file_bytes = storage.get(pending["minio_key"])
-            _docs = _ocr_pf(file_bytes, pending["filename"], pending["mimetype"])
-            if _docs:
-                _settings = _grs()
-                _config = _CC(
-                    chunk_size=_settings.chunk_size,
-                    chunk_overlap=_settings.chunk_overlap,
-                    strategy=_settings.chunking_strategy,
-                    parent_chunk_size=_settings.parent_chunk_size,
-                    child_chunk_size=_settings.child_chunk_size,
-                )
-                _chunks = _cdwp(_docs, _config)
-                _vs = _gvs(target_collection)
-                _vs.add_documents(_chunks)
-                await slack_bot.post_message(
-                    pending["channel_id"],
-                    f"✅ `{pending['filename']}` → `{target_collection}` ({len(_chunks)} chunks)",
-                    thread_ts=thread_ts,
-                )
-                logger.info(f"File {pending['filename']} indexed into {target_collection}: {len(_chunks)} chunks")
+            assignments = []
+            if stripped.lower() == "all":
+                assignments = list(suggestions)
+            elif stripped.lower().startswith("all:"):
+                target = _resolve_name(stripped[4:])
+                assignments = [target] * n_files
+            elif stripped.isdigit() and 1 <= int(stripped) <= len(options):
+                target = options[int(stripped) - 1]
+                assignments = [target] * n_files
+            elif ":" in stripped or ("," in stripped and any(c.isdigit() for c in stripped)):
+                # Per-file: "1: name, 2: name" or "1:name,2:name"
+                assignments = list(suggestions)  # default to suggestions
+                import re as _re
+                for part in _re.split(r"[,;]\s*", stripped):
+                    part = part.strip()
+                    if ":" in part:
+                        idx_str, name_str = part.split(":", 1)
+                        idx_str = idx_str.strip()
+                        if idx_str.isdigit() and 1 <= int(idx_str) <= n_files:
+                            assignments[int(idx_str) - 1] = _resolve_name(name_str)
             else:
-                await slack_bot.post_message(
-                    pending["channel_id"],
-                    f"⚠️ `{pending['filename']}`: không trích xuất được text",
-                    thread_ts=thread_ts,
-                )
-        except Exception as e:
-            logger.error(f"File import finalize error: {e}")
-            await slack_bot.post_message(
-                pending["channel_id"],
-                f"❌ Import failed: {str(e)[:100]}",
-                thread_ts=thread_ts,
-            )
+                # Single collection name for all
+                target = _resolve_name(stripped)
+                assignments = [target] * n_files
+
+        # Import each file into its assigned collection
+        _cc_params = pending["chunk_config"]
+        _config = _CC(**_cc_params)
+        summary_lines = []
+        for i, f in enumerate(pending["files"]):
+            target_coll = assignments[i] if i < len(assignments) else default_coll
+            try:
+                _chunks, _ = _cdwp(f["documents"], _config)
+                _vs = _gvs(target_coll)
+                _vs.add_documents(_chunks)
+                _size_str = f"{f['file_size'] / 1024:.1f}KB" if f["file_size"] < 1024 * 1024 else f"{f['file_size'] / 1024 / 1024:.1f}MB"
+                summary_lines.append(f"✅ `{f['filename']}` ({_size_str}) → `{target_coll}` ({len(_chunks)} chunks)")
+                logger.info(f"Indexed {f['filename']} → {target_coll}: {len(_chunks)} chunks")
+            except Exception as e:
+                summary_lines.append(f"❌ `{f['filename']}`: {str(e)[:80]}")
+                logger.error(f"Import failed for {f['filename']}: {e}")
+
+        await slack_bot.post_message(
+            pending["channel_id"],
+            "📁 *Import complete:*\n" + "\n".join(summary_lines),
+            thread_ts=thread_ts,
+        )
         return
 
     # ── Session Awareness Gate ──
@@ -1924,16 +1973,23 @@ async def process_slack_files(
     thread_ts: str | None,
     files: list[dict],
 ):
-    """Download Slack files, store in MinIO, process with OCR/Vision, index into RAG."""
+    """Download Slack files, store in MinIO, process with OCR/Vision, index into RAG (batch)."""
     from rag.ocr import process_file as ocr_process_file
     from rag.chunking import ChunkingConfig, chunk_documents_with_parents
-    from rag.indexing import get_vectorstore
+    from rag.indexing import get_vectorstore, list_collections
     from rag.config import get_rag_settings
+    from agent.tools import get_active_collection
+    import hashlib
 
     thread_id = thread_ts or event_ts
     results = []
     errors = []
+    processed_files = []  # collected for batch HITL
 
+    settings = get_rag_settings()
+    default_collection = settings.default_collection
+
+    # ── Phase 1: Download + dedup + MinIO + OCR ──
     for i, file_info in enumerate(files):
         filename = file_info.get("name", f"file_{i}")
         file_size = file_info.get("size", 0)
@@ -1942,145 +1998,168 @@ async def process_slack_files(
 
         logger.info(f"Processing file {i+1}/{len(files)}: {filename} ({file_size} bytes, {mimetype})")
 
-        # Size check
         if file_size > MAX_SLACK_FILE_SIZE:
             errors.append(f"❌ `{filename}`: quá lớn ({file_size / 1024 / 1024 / 1024:.1f}GB > 1GB)")
             continue
 
-        # Download from Slack (authenticated via Web API)
         file_id = file_info.get("id", "")
         try:
             file_bytes = await slack_bot.download_file(file_id)
             if file_bytes is None:
-                raise RuntimeError("download returned None (scope missing or file unavailable)")
+                raise RuntimeError("download returned None")
         except Exception as e:
             errors.append(f"❌ `{filename}`: download failed ({e})")
             continue
 
-        # Store in MinIO
+        # Dedup
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
         try:
             from api.server import storage
-            minio_key = f"slack/{user_id}/{event_ts}_{filename}"
-            storage.put(minio_key, file_bytes, content_type=mimetype)
-            logger.info(f"Stored in MinIO: {minio_key}")
-        except Exception as e:
-            logger.warning(f"MinIO storage failed for {filename}: {e} (continuing with indexing)")
+            if storage.exists(f"slack/hashes/{file_hash}"):
+                results.append(f"⏭️ `{filename}`: duplicate, skip")
+                continue
+        except Exception:
+            pass
 
-        # Process with OCR/Vision pipeline
+        # MinIO
+        minio_key = f"slack/{user_id}/{event_ts}_{filename}"
+        try:
+            from api.server import storage
+            storage.put(minio_key, file_bytes, content_type=mimetype)
+            storage.put(f"slack/hashes/{file_hash}", b"1", content_type="text/plain")
+        except Exception as e:
+            logger.warning(f"MinIO failed for {filename}: {e}")
+
+        # OCR
         try:
             documents = ocr_process_file(file_bytes, filename, mimetype)
             if not documents:
                 results.append(f"⚠️ `{filename}`: không trích xuất được text")
                 continue
+            processed_files.append({
+                "filename": filename,
+                "file_size": file_size,
+                "mimetype": mimetype,
+                "filetype": filetype,
+                "minio_key": minio_key,
+                "documents": documents,
+            })
+        except Exception as e:
+            logger.error(f"OCR error for {filename}: {e}")
+            errors.append(f"❌ `{filename}`: {str(e)[:100]}")
 
-            settings = get_rag_settings()
-            default_collection = settings.default_collection
+    if not processed_files:
+        lines = results + errors or ["⚠️ Không có file nào để xử lý."]
+        summary = "\n".join(lines)
+        if msg:
+            summary += f"\n\n_(Query: {msg[:100]})_"
+        await slack_bot.post_message(channel_id, summary[:3000], thread_ts=thread_ts)
+        return
 
-            # Determine target collection
-            from agent.tools import get_active_collection
-            active_collection = get_active_collection()
+    # ── Phase 2: Route + Index ──
+    active_collection = get_active_collection()
+    chunk_config = ChunkingConfig(
+        chunk_size=settings.chunk_size,
+        chunk_overlap=settings.chunk_overlap,
+        strategy=settings.chunking_strategy,
+        parent_chunk_size=settings.parent_chunk_size,
+        child_chunk_size=settings.child_chunk_size,
+    )
 
-            if active_collection != default_collection:
-                # Fast path: project active → index directly
-                target_collection = active_collection
-                config = ChunkingConfig(
-                    chunk_size=settings.chunk_size,
-                    chunk_overlap=settings.chunk_overlap,
-                    strategy=settings.chunking_strategy,
-                    parent_chunk_size=settings.parent_chunk_size,
-                    child_chunk_size=settings.child_chunk_size,
+    if active_collection != default_collection:
+        # Fast path: project active → index all directly
+        for f in processed_files:
+            chunks, _ = chunk_documents_with_parents(f["documents"], chunk_config)
+            vs = get_vectorstore(active_collection)
+            vs.add_documents(chunks)
+            doc_type = f["documents"][0].metadata.get("type", f["filetype"])
+            size_str = f"{f['file_size'] / 1024:.1f}KB" if f["file_size"] < 1024 * 1024 else f"{f['file_size'] / 1024 / 1024:.1f}MB"
+            results.append(
+                f"✅ `{f['filename']}` ({size_str}, {doc_type})\n"
+                f"   Collection: `{active_collection}` | Chunks: {len(chunks)}"
+            )
+            logger.info(f"Indexed {f['filename']} → {active_collection}: {len(chunks)} chunks")
+
+    else:
+        # No active project
+        all_collections = list_collections(min_count=1)
+        other_collections = [(n, c) for n, c in all_collections if n != default_collection]
+
+        if not other_collections:
+            # Only rag_kb exists → index all into rag_kb
+            for f in processed_files:
+                chunks, _ = chunk_documents_with_parents(f["documents"], chunk_config)
+                vs = get_vectorstore(default_collection)
+                vs.add_documents(chunks)
+                doc_type = f["documents"][0].metadata.get("type", f["filetype"])
+                size_str = f"{f['file_size'] / 1024:.1f}KB" if f["file_size"] < 1024 * 1024 else f"{f['file_size'] / 1024 / 1024:.1f}MB"
+                results.append(
+                    f"✅ `{f['filename']}` ({size_str}, {doc_type})\n"
+                    f"   Collection: `{default_collection}` | Chunks: {len(chunks)}"
                 )
-                chunks = chunk_documents_with_parents(documents, config)
-                vectorstore = get_vectorstore(target_collection)
-                vectorstore.add_documents(chunks)
-                doc_type = documents[0].metadata.get("type", filetype)
-                results.append(f"✓ `{filename}`: {len(chunks)} chunks → `{target_collection}` ({doc_type})")
-                logger.info(f"Indexed {filename} → {target_collection}: {len(chunks)} chunks")
-                continue
+        else:
+            # HITL: batch classify + consolidated prompt
+            suggestions = await _classify_files_batch(processed_files, other_collections)
 
-            # No active project → check if other collections exist
-            from rag.indexing import list_collections
-            all_collections = list_collections(min_count=1)
-            other_collections = [(n, c) for n, c in all_collections if n != default_collection]
+            # Build options list (union of all suggestions + all collections + rag_kb)
+            all_option_names = list(dict.fromkeys(
+                [suggestions[i] for i in range(len(processed_files))]
+                + [name for name, _ in other_collections]
+                + [default_collection]
+            ))
 
-            if not other_collections:
-                # No other collections → just use rag_kb
-                target_collection = default_collection
-                config = ChunkingConfig(
-                    chunk_size=settings.chunk_size,
-                    chunk_overlap=settings.chunk_overlap,
-                    strategy=settings.chunking_strategy,
-                    parent_chunk_size=settings.parent_chunk_size,
-                    child_chunk_size=settings.child_chunk_size,
-                )
-                chunks = chunk_documents_with_parents(documents, config)
-                vectorstore = get_vectorstore(target_collection)
-                vectorstore.add_documents(chunks)
-                doc_type = documents[0].metadata.get("type", filetype)
-                results.append(f"✓ `{filename}`: {len(chunks)} chunks → `{target_collection}` ({doc_type})")
-                logger.info(f"Indexed {filename} → {target_collection}: {len(chunks)} chunks")
-                continue
-
-            # HITL path: classify + ask user
-            content_preview = documents[0].page_content if documents else ""
-            suggested = await _classify_file_for_collection(content_preview, other_collections)
-
-            # Build options (suggestion first, rag_kb last)
-            options = []
-            for name, count in other_collections:
-                if name == suggested:
-                    options.insert(0, (name, count))
-                else:
-                    options.append((name, count))
-            if suggested not in [o[0] for o in options]:
-                options.insert(0, (suggested, 0))
-            options.append((default_collection, 0))
-
-            # Store pending state
-            _pending_file_imports[thread_id] = {
+            # Store batch pending state
+            _pending_file_imports[user_id] = {
                 "channel_id": channel_id,
                 "user_id": user_id,
-                "minio_key": minio_key,
-                "filename": filename,
-                "mimetype": mimetype,
-                "options": options,
-                "suggested": suggested,
+                "thread_ts": thread_ts or event_ts,
+                "files": processed_files,
+                "suggestions": suggestions,
+                "options": all_option_names,
+                "chunk_config": {
+                    "chunk_size": settings.chunk_size,
+                    "chunk_overlap": settings.chunk_overlap,
+                    "strategy": settings.chunking_strategy,
+                    "parent_chunk_size": settings.parent_chunk_size,
+                    "child_chunk_size": settings.child_chunk_size,
+                },
                 "timestamp": time.time(),
             }
 
-            # Post confirmation prompt to Slack
-            option_lines = "\n".join(
-                f"{i+1}. `{name}` ({count} chunks)" if count else f"{i+1}. `{name}`"
-                for i, (name, count) in enumerate(options)
-            )
-            prompt_text = (
-                f"📁 File `{filename}` đã OCR xong.\n\n"
-                f"Có vẻ thuộc: **{suggested}**\n\n"
-                f"Chọn collection để import:\n{option_lines}\n\n"
-                f"_(Gõ số hoặc tên collection, 30 phút hết hạn → mặc định `rag_kb`)"
-            )
-            await slack_bot.post_message(channel_id, prompt_text, thread_ts=thread_ts)
-            results.append(f"⏳ `{filename}`: chờ chọn collection...")
-            logger.info(f"File {filename} awaiting collection choice (suggested: {suggested})")
+            # Build consolidated prompt
+            lines = [f"📁 Đã OCR **{len(processed_files)} files**. Chọn collection:\n"]
+            for i, f in enumerate(processed_files):
+                size_str = f"{f['file_size'] / 1024:.1f}KB" if f["file_size"] < 1024 * 1024 else f"{f['file_size'] / 1024 / 1024:.1f}MB"
+                lines.append(f"**{i+1}.** `{f['filename']}` ({size_str}) → *{suggestions[i]}*")
+            lines.append("")
+            lines.append("Collections:")
+            for i, name in enumerate(all_option_names):
+                count = next((c for n, c in other_collections if n == name), 0)
+                lines.append(f"  {i+1}. `{name}`" + (f" ({count})" if count else ""))
+            lines.append("")
+            lines.append("Reply:")
+            lines.append("• `all` → import tất cả vào collection được suggest")
+            lines.append("• `all: <name>` → tất cả vào collection đó")
+            lines.append("• `1: <name>, 2: <name>` → custom per file")
+            lines.append("• Số duy nhất (ví dụ `3`) → tất cả vào collection #3")
+            lines.append("")
+            lines.append("_(30 phút hết hạn → mặc định `rag_kb`)_")
 
-        except Exception as e:
-            logger.error(f"Error processing {filename}: {e}")
-            errors.append(f"❌ `{filename}`: {str(e)[:100]}")
+            await slack_bot.post_message(channel_id, "\n".join(lines)[:4000], thread_ts=thread_ts)
+            results.append(f"⏳ {len(processed_files)} files: chờ chọn collection...")
+            logger.info(f"Batch of {len(processed_files)} files awaiting collection choice")
 
-    # Post summary to Slack
+    # ── Post summary ──
     lines = []
     if results:
-        lines.append("*📁 Đã xử lý files:*")
         lines.extend(results)
     if errors:
         lines.extend(errors)
     if not lines:
         lines.append("⚠️ Không có file nào để xử lý.")
-
     summary = "\n".join(lines)
-    if msg:
+    if msg and not any("chờ chọn" in r for r in results):
         summary += f"\n\n_(Query: {msg[:100]})_"
-
     try:
         await slack_bot.post_message(channel_id, summary[:3000], thread_ts=thread_ts)
     except Exception as e:
