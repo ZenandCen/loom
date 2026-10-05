@@ -199,6 +199,7 @@ def synthesize_node(state: TeamState) -> dict:
         ("code_result", "Code Exploration"),
         ("db_result", "Database Query"),
         ("web_result", "Web Research"),
+        ("sre_result", "SRE / Infrastructure Trace"),
     ]:
         val = state.get(key, "")
         if val:
@@ -279,6 +280,7 @@ def build_team_output(state: TeamState) -> TeamOutput:
         "code_result": (WorkerName.CODE, "code_sources"),
         "db_result": (WorkerName.DB, "db_sources"),
         "web_result": (WorkerName.WEB, "web_sources"),
+        "sre_result": (WorkerName.SRE, "sre_sources"),
     }
 
     for key, (name, src_key) in worker_map.items():

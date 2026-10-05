@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 _ENSEMBLE = os.getenv("LOOM_PLANNER_ENSEMBLE", "1") == "1"
 _JUDGE = os.getenv("LOOM_PLANNER_JUDGE", "gemini").lower()
 
-KNOWN_WORKERS = {"rag_analyst", "code_explorer", "db_analyst", "web_researcher"}
+KNOWN_WORKERS = {"rag_analyst", "code_explorer", "db_analyst", "web_researcher", "sre_tracer"}
 
 ROUTER_SYSTEM = """\
 You are a planning supervisor. Given the user's request, decide which worker(s) should handle it and draft a task.
@@ -34,9 +34,10 @@ Available workers:
 - code_explorer: Read and analyze source code. Use for code structure, implementation details, architecture, "how does X work".
 - db_analyst: Query PostgreSQL database. Use for table schema, data queries, SQL, data relationships.
 - web_researcher: Search the web. Use for external knowledge, general knowledge, health, science, facts, definitions, current events, technology best practices.
+- sre_tracer: Trace infrastructure incidents. Use for: "why did X fail/timeout?", "check system health", "what was deployed recently?", "analyze slow queries", "check pod status/logs", "trace an error in production", "check NGINX errors", "correlate logs with deployments".
 
 Respond with EXACTLY this format (no extra text):
-WORKERS: <comma-separated list from: rag_analyst, code_explorer, db_analyst, web_researcher, or "none">
+WORKERS: <comma-separated list from: rag_analyst, code_explorer, db_analyst, web_researcher, sre_tracer, or "none">
 TASKS:
 - <worker>: <specific task instruction>
 
@@ -46,6 +47,8 @@ Worker selection rules:
 - Question about indexed project documents/files / learned knowledge → rag_analyst
 - GENERAL-knowledge question NOT tied to the project (health, science, how-things-work, facts, current events, translations, definitions) → web_researcher
 - "How to build X" / "Best practice for X" / "What technology should I use" → code_explorer (existing patterns) + web_researcher (modern solutions)
+- Infrastructure/production issues: "trace", "why is X slow/broken", "check logs", "check pods", "what was deployed", "error in production", "timeout", "500 error", "slow query in prod", "check system health" → sre_tracer
+- Correlation questions (e.g. "why did X break after Y deploy?") → sre_tracer
 - A genuine question that asks for information is NEVER "none" — always pick at least one worker.
 - "WORKERS: none" is ONLY for pure greetings ("hello", "hi", "thank you"), pleasantries, or meta-commands (set_project, remember, reset).
 - If only 1 worker is needed, list only that one.
@@ -55,6 +58,7 @@ Task specificity rules:
 - If the user's question is ambiguous, make a reasonable interpretation and state it in the task (e.g., "Interpreting 'the API' as the REST endpoints in src/routes/").
 - For architecture questions: specify what aspect (data flow, component interaction, entry points, layer structure).
 - For "how does X work": specify the starting point (entry point, API endpoint, function) and what level of detail (high-level flow vs line-by-line).
+- For sre_tracer: specify the time window, the service/namespace/pod name, and what to correlate (logs + deploys + metrics).
 - Do NOT write vague tasks like "analyze the code" or "find relevant information". Be surgical.
 """
 
@@ -75,6 +79,7 @@ Task writing rules:
 - For db_analyst: specify which tables to examine and what relationships to trace.
 - For rag_analyst: specify what topic/entity to find in the documents.
 - For web_researcher: specify the exact search query with relevant technical terms.
+- For sre_tracer: specify the time window, service/namespace, what to check (logs, deploys, metrics, DB), and what to correlate.
 - Include context from the conversation if relevant (e.g., "The user previously asked about X, now they want to know Y related to X").
 """
 

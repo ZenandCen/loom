@@ -9,6 +9,7 @@ class WorkerName(str, Enum):
     CODE = "code_explorer"
     DB = "db_analyst"
     WEB = "web_researcher"
+    SRE = "sre_tracer"
 
 
 class TeamInput(BaseModel):

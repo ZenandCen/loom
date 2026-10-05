@@ -440,3 +440,34 @@ def web_worker(state: dict) -> dict:
     sources = re.findall(r'https?://\S+', str(search_results))[:5]
     logger.info(f"[WEB WORKER] Done: {len(result)} chars, {len(sources)} sources")
     return {"web_result": result, "web_sources": sources}
+
+
+def sre_worker(state: dict) -> dict:
+    """SRE worker: ReAct agent with Prometheus/Loki/PMM/GitLab/NGINX tools for incident tracing."""
+    task = state.get("task", "")
+    logger.info(f"[SRE WORKER] {task[:100]}")
+
+    from agent.sre.tools import ALL_SRE_TOOLS
+    from agent.subagents.sre_agent import SRE_AGENT_PROMPT
+    from langchain.agents import create_agent
+
+    agent = create_agent(
+        model=_worker_model,
+        tools=ALL_SRE_TOOLS,
+        system_prompt=SRE_AGENT_PROMPT,
+    )
+
+    history = state.get("history", "")
+    history_block = f"\n\nPrevious conversation:\n{history}\n" if history else ""
+    try:
+        result = agent.invoke(
+            {"messages": [("user", f"{task}{history_block}")]},
+            config={"recursion_limit": 20},
+        )
+        content = result["messages"][-1].content
+    except Exception as e:
+        logger.error(f"[SRE WORKER] Agent failed: {e}")
+        content = f"Error: {e}"
+
+    logger.info(f"[SRE WORKER] Done: {len(content)} chars")
+    return {"sre_result": content, "sre_sources": []}

@@ -32,6 +32,8 @@ class TeamState(TypedDict, total=False):
     db_sources: list[str]
     web_result: str
     web_sources: list[str]
+    sre_result: str
+    sre_sources: list[str]
 
     # Final output
     synthesis: str

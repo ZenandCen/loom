@@ -13,7 +13,7 @@ from langgraph.types import Send
 from agent.team.planner import plan_node, _parse_workers
 from agent.team.state import TeamState
 from agent.team.synthesizer import synthesize_node
-from agent.team.workers import code_worker, db_worker, rag_worker, web_worker
+from agent.team.workers import code_worker, db_worker, rag_worker, web_worker, sre_worker
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,7 @@ WORKER_MAP = {
     "code_explorer": ("code_worker", "code_result"),
     "db_analyst": ("db_worker", "db_result"),
     "web_researcher": ("web_worker", "web_result"),
+    "sre_tracer": ("sre_worker", "sre_result"),
 }
 
 
@@ -97,12 +98,13 @@ def build_team_graph(checkpointer=None):
     graph.add_node("code_worker", code_worker)
     graph.add_node("db_worker", db_worker)
     graph.add_node("web_worker", web_worker)
+    graph.add_node("sre_worker", sre_worker)
     graph.add_node("synthesize", synthesize_node)
 
     # Edges
     graph.add_edge(START, "planner")
     graph.add_conditional_edges("planner", route_after_plan, [
-        "rag_worker", "code_worker", "db_worker", "web_worker", "synthesize",
+        "rag_worker", "code_worker", "db_worker", "web_worker", "sre_worker", "synthesize",
     ])
 
     # All workers converge to synthesize
@@ -110,6 +112,7 @@ def build_team_graph(checkpointer=None):
     graph.add_edge("code_worker", "synthesize")
     graph.add_edge("db_worker", "synthesize")
     graph.add_edge("web_worker", "synthesize")
+    graph.add_edge("sre_worker", "synthesize")
     graph.add_edge("synthesize", END)
 
     compile_kwargs = {}
