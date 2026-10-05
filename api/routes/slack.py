@@ -45,6 +45,13 @@ _active_session: dict[str, str] = {}
 # "keep my session, don't ask me again" behavior.
 _session_confirmed: set[str] = set()
 
+# RAG confirmed scope per thread: thread_id → list of confirmed collection names.
+# Prevents re-asking HITL on follow-up questions within the same conversation.
+_rag_scope_cache: dict[str, list[str]] = {}
+
+# Last raw markdown response per user (for !md copy-paste)
+_last_md_response: dict[str, str] = {}
+
 # Discovered DB connections from project config scan (for `db 1`, `db 2` shorthand)
 _discovered_connections: list[dict] = []  # [{"label": "uri.source", "type": "mysql", "dsn": "mysql://..."}]
 # Discovered databases per connection number (for `db <conn> <db_num>`)
@@ -188,6 +195,112 @@ def _load_thread_history_summary(thread_id: str, max_exchanges: int = 3) -> str:
 
 
 # ── Session Awareness Helpers ─────────────────────────────────────────────────
+
+def _md_table_to_text(lines: list[str]) -> str:
+    """Convert a markdown table (list of lines) to Slack-friendly bullet text."""
+    if len(lines) < 2:
+        return "\n".join(lines)
+    # Parse header row
+    header = [c.strip() for c in lines[0].strip("|").split("|")]
+    # Skip separator row (---)
+    data_start = 1
+    if re.match(r"^\s*\|?[\s\-:|]+\|?\s*$", lines[1]):
+        data_start = 2
+    parts = []
+    for row in lines[data_start:]:
+        cells = [c.strip() for c in row.strip("|").split("|")]
+        # Build "Header: Value" pairs
+        pairs = []
+        for i, cell in enumerate(cells):
+            if i < len(header):
+                h = re.sub(r"\*\*(.*?)\*\*", r"\1", header[i])
+                v = re.sub(r"\*\*(.*?)\*\*", r"\1", cell)
+                pairs.append(f"{h}: {v}")
+        if pairs:
+            parts.append("  " + " | ".join(pairs))
+    return "\n".join(parts) if parts else ""
+
+
+def _md_to_slack(text: str) -> str:
+    """Convert markdown to Slack-friendly formatting.
+
+    Slack does NOT render: markdown tables, ## headers, **bold**.
+    This converts them to Slack-native formatting.
+    """
+    if not text:
+        return text
+
+    lines = text.split("\n")
+    out: list[str] = []
+    in_code_block = False
+    table_buffer: list[str] = []
+
+    for line in lines:
+        # Toggle code block
+        if line.strip().startswith("```"):
+            if table_buffer:
+                out.append(_md_table_to_text(table_buffer))
+                table_buffer = []
+            in_code_block = not in_code_block
+            out.append(line)
+            continue
+
+        # Inside code block: pass through
+        if in_code_block:
+            out.append(line)
+            continue
+
+        # Table detection: line starts with |
+        if line.strip().startswith("|"):
+            table_buffer.append(line)
+            continue
+        else:
+            if table_buffer:
+                out.append(_md_table_to_text(table_buffer))
+                table_buffer = []
+
+        # Headers: ## → *BOLD*, ### → *bold*
+        m = re.match(r"^(#{1,6})\s+(.+)$", line)
+        if m:
+            level = len(m.group(1))
+            content = m.group(2).strip()
+            # Strip markdown bold from content
+            content = re.sub(r"\*\*(.*?)\*\*", r"\1", content)
+            if level <= 2:
+                out.append(f"*{content.upper()}*")
+            else:
+                out.append(f"*{content}*")
+            continue
+
+        # Horizontal rule
+        if re.match(r"^\s*(-{3,}|_{3,}|\*{3,})\s*$", line):
+            out.append("━━━━━━━━━━━━━━━━━━")
+            continue
+
+        # Bold: **text** → *text*
+        line = re.sub(r"\*\*(.+?)\*\*", r"*\1*", line)
+
+        # Italic: *text* → _text_ (only single asterisks not already handled)
+        # Skip if it's a Slack bold (*text*)
+        line = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"_\1_", line)
+
+        # Links: [text](url) → <url|text>
+        line = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<\2|\1>", line)
+
+        # Bullet points: - → •
+        line = re.sub(r"^(\s*)[-*]\s+", r"\1• ", line)
+
+        out.append(line)
+
+    # Flush remaining table
+    if table_buffer:
+        out.append(_md_table_to_text(table_buffer))
+
+    result = "\n".join(out)
+    # Collapse 3+ blank lines to 2
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
+
 
 def _thread_has_history(thread_id: str) -> bool:
     """Check if a thread has any checkpoints (i.e., prior conversation)."""
@@ -1018,6 +1131,10 @@ async def process_message(
             _active_session[user_id] = str(time.time())  # fresh session (old history not loaded)
             _pending_messages.pop(user_id, None)
             _session_confirmed.discard(user_id)
+            # Clear RAG scope cache for all threads of this user (new session = re-ask)
+            _old_tid = _active_session.get(user_id)
+            for _t in list(_rag_scope_cache.keys()):
+                del _rag_scope_cache[_t]
             await slack_bot.post_message(
                 channel_id,
                 "🔄 Đã về chế độ **rag_kb** (free). Session mới — không phụ thuộc project.\n"
@@ -1027,6 +1144,21 @@ async def process_message(
         except Exception as e:
             await slack_bot.post_message(
                 channel_id, f"Reset: {e}", thread_ts=thread_ts
+            )
+        return
+
+    # Command: !md — return the last response in raw markdown (for copy-paste)
+    if msg.strip().lower() in ("!md", "!markdown", "markdown"):
+        raw_md = _last_md_response.get(user_id, "")
+        if raw_md:
+            # Send as code block so Slack preserves formatting for copy-paste
+            chunk = "```\n" + raw_md[:38000] + "\n```"
+            await slack_bot.post_message(channel_id, chunk, thread_ts=thread_ts)
+        else:
+            await slack_bot.post_message(
+                channel_id,
+                "Không có markdown nào để gửi. Hãy hỏi một câu trước, rồi dùng `!md` để nhận bản markdown.",
+                thread_ts=thread_ts,
             )
         return
 
@@ -1897,19 +2029,30 @@ async def process_message(
         if pending:
             logger.info(f"HITL resume thread={config['configurable']['thread_id']} decision={msg[:80]!r}")
             raw_result = await team.ainvoke(Command(resume=msg), team_config)
+            # After HITL resume, store the confirmed scope in cache for follow-ups
+            _tid = config["configurable"]["thread_id"]
+            if isinstance(raw_result, dict) and raw_result.get("rag_confirmed_scope"):
+                _rag_scope_cache[_tid] = raw_result["rag_confirmed_scope"]
+                logger.info(f"RAG scope cached for thread={_tid}: {_rag_scope_cache[_tid]}")
         else:
             # Build validated input
             project_dir = _get_project_dir()
             project_name = "" if project_dir == CODE_BASE_DIR else project_dir.name
             # Load conversation history from checkpointer (last 3 exchanges)
             history = _load_thread_history_summary(config["configurable"]["thread_id"])
+            _tid = config["configurable"]["thread_id"]
             team_input = TeamInput(
                 user_query=msg,
                 user_id=user_id,
                 project=project_name,
                 history=history,
             )
-            raw_result = await team.ainvoke(team_input.model_dump(), team_config)
+            # Inject cached RAG scope to avoid re-asking HITL on follow-ups
+            _input_dict = team_input.model_dump()
+            if _tid in _rag_scope_cache:
+                _input_dict["rag_confirmed_scope"] = _rag_scope_cache[_tid]
+                logger.info(f"Injecting cached RAG scope for thread={_tid}: {_rag_scope_cache[_tid]}")
+            raw_result = await team.ainvoke(_input_dict, team_config)
 
         # --- Human-in-the-loop: a worker paused to ask for confirmation -> prompt user.
         if isinstance(raw_result, dict) and raw_result.get("__interrupt__"):
@@ -1930,10 +2073,21 @@ async def process_message(
         if not response or response == "I processed your request but have no response to share.":
             response = "I processed your request but have no response to share."
 
+        # Store raw markdown for !md retrieval
+        _last_md_response[user_id] = response
+
+        # Convert to Slack-friendly format
+        response = _md_to_slack(response)
+
         logger.info(f"AI reply: {len(response)} chars, {len(output.workers)} workers, diagram={output.diagram_type.value}")
-        result_slack = await slack_bot.post_message(channel_id, response, thread_ts=thread_ts)
+        result_slack = await slack_bot.post_message(channel_id, response[:39000], thread_ts=thread_ts)
         if result_slack.get("ok"):
             logger.info(f"Message posted to Slack successfully")
+            # Pin the session: once AI responds successfully, lock the user to this
+            # session so follow-up messages (even in different threads) maintain context.
+            # Only cleared by !reset.
+            _active_session[user_id] = session_id
+            _session_confirmed.add(user_id)
         else:
             logger.error(f"Slack API error for channel={channel_id}: {result_slack}")
 

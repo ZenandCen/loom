@@ -20,6 +20,9 @@ class TeamState(TypedDict, total=False):
     task_votes: dict[str, str]
     routed: list[str]
 
+    # RAG scope (persisted across turns to avoid re-asking HITL on follow-ups)
+    rag_confirmed_scope: list[str]
+
     # Worker results
     rag_result: str
     rag_sources: list[str]

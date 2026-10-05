@@ -25,20 +25,21 @@ CTX_WINDOW = int(os.getenv("LOOM_CTX_WINDOW", "8000"))
 CTX_MAX_WINDOWS = int(os.getenv("LOOM_CTX_MAX_WINDOWS", "5"))
 
 
-def _llm_summarize(system: str, context: str, task: str) -> str:
+def _llm_summarize(system: str, context: str, task: str, history: str = "") -> str:
     """LLM call: single-shot if small, iterative map-reduce if context > threshold."""
     if len(context) <= CTX_THRESHOLD:
-        return _single_llm_call(system, context, task)
-    return _iterative_llm_call(system, context, task)
+        return _single_llm_call(system, context, task, history)
+    return _iterative_llm_call(system, context, task, history)
 
 
-def _single_llm_call(system: str, context: str, task: str) -> str:
+def _single_llm_call(system: str, context: str, task: str, history: str = "") -> str:
     """Single LLM call: system + context + task → answer."""
     from langchain_core.messages import HumanMessage, SystemMessage
 
+    history_block = f"\n\nPrevious conversation context (for follow-up understanding):\n{history}\n" if history else ""
     messages = [
         SystemMessage(content=system),
-        HumanMessage(content=f"Context:\n{context}\n\nTask: {task}\n\nAnswer comprehensively with specific references. Include all relevant details, names, and specifics from the context. Do NOT be brief."),
+        HumanMessage(content=f"Context:\n{context}{history_block}\n\nTask: {task}\n\nAnswer comprehensively with specific references. Include all relevant details, names, and specifics from the context. Do NOT be brief. If the task is a follow-up (e.g., 'continue', 'tell me more'), build on the previous conversation context."),
     ]
     response = _worker_model.invoke(messages)
     content = response.content
@@ -66,7 +67,7 @@ def _split_windows(context: str, window_size: int) -> list[str]:
     return windows
 
 
-def _iterative_llm_call(system: str, context: str, task: str) -> str:
+def _iterative_llm_call(system: str, context: str, task: str, history: str = "") -> str:
     """Iterative map-reduce: summarize each window, then answer from summaries.
 
     Used when context exceeds CTX_THRESHOLD to avoid exceeding LLM token limits.
@@ -90,9 +91,10 @@ def _iterative_llm_call(system: str, context: str, task: str) -> str:
 
     # Reduce: answer from summaries
     combined = "\n\n---\n\n".join(f"[{i+1}] {s}" for i, s in enumerate(summaries))
+    history_block = f"\n\nPrevious conversation context (for follow-up understanding):\n{history}\n" if history else ""
     response = _worker_model.invoke([
         SystemMessage(content=system),
-        HumanMessage(content=f"Summarized context:\n{combined}\n\nTask: {task}\n\nAnswer comprehensively with specific references. Include all relevant details, names, and specifics. Do NOT be brief."),
+        HumanMessage(content=f"Summarized context:\n{combined}{history_block}\n\nTask: {task}\n\nAnswer comprehensively with specific references. Include all relevant details, names, and specifics. Do NOT be brief. If the task is a follow-up, build on the previous conversation context."),
     ])
     content = response.content
     if isinstance(content, list):
@@ -193,6 +195,8 @@ def rag_worker(state: dict) -> dict:
     scope_note = ""
     context = ""
 
+    confirmed_scope: list[str] = []
+
     if free_mode:
         from rag.indexing import list_collections
         learned = list_collections(min_count=1)
@@ -200,28 +204,18 @@ def rag_worker(state: dict) -> dict:
         if not learned_names:
             context = _basic_retrieve(task, collection, sources)
         else:
-            from rag.retrieval import discover_projects, retrieve_across_collections
-            candidates = discover_projects(task, learned_names)
-            candidate_names = [name for name, _ in candidates]
-            if not candidate_names:
-                context = "(no relevant projects found in the knowledge base)"
-            else:
-                # Human-in-the-loop: confirm which projects to fetch.
-                # NOTE: interrupt() must NOT sit inside a try/except — it pauses the graph.
-                from langgraph.types import interrupt
-                decision = interrupt({
-                    "type": "rag_scope_confirm",
-                    "candidates": candidate_names,
-                    "all_projects": learned_names,
-                    "query": task,
-                })
-                confirmed = _parse_scope_decision(decision, candidate_names, learned_names)
-                if not confirmed:
-                    context = "(User declined the cross-project search.)"
-                else:
+            # Check if we already have a confirmed scope from a previous turn in this session.
+            # If yes, reuse it (skip HITL) — user only re-confirms on !reset.
+            prior_scope = state.get("rag_confirmed_scope") or []
+            logger.info(f"[RAG WORKER] prior_scope={prior_scope}, state keys={list(state.keys())}")
+            if prior_scope:
+                # Validate: only keep collections that still exist
+                valid_scope = [c for c in prior_scope if c in learned_names]
+                if valid_scope:
+                    confirmed_scope = valid_scope
+                    scope_note = "Projects searched (from session): " + ", ".join(f"`{c}`" for c in confirmed_scope) + "."
                     try:
-                        scope_note = "Projects searched: " + ", ".join(f"`{c}`" for c in confirmed) + "."
-                        res = retrieve_across_collections(task, confirmed, k_per_collection=8, max_total=40)
+                        res = retrieve_across_collections(task, confirmed_scope, k_per_collection=8, max_total=40)
                         context = "\n\n".join(res.context_blocks) if res.context_blocks else "(no matching content found in the selected projects)"
                         for s in res.sources:
                             if s not in sources:
@@ -229,6 +223,42 @@ def rag_worker(state: dict) -> dict:
                     except Exception as e:
                         logger.warning(f"Cross-collection retrieval failed: {e}")
                         context = f"(cross-project retrieval error: {e})"
+                    logger.info(f"[RAG WORKER] Reusing confirmed scope: {confirmed_scope}")
+                else:
+                    # All previously confirmed collections no longer exist → re-ask
+                    prior_scope = []
+
+            if not prior_scope:
+                from rag.retrieval import discover_projects, retrieve_across_collections
+                candidates = discover_projects(task, learned_names)
+                candidate_names = [name for name, _ in candidates]
+                if not candidate_names:
+                    context = "(no relevant projects found in the knowledge base)"
+                else:
+                    # Human-in-the-loop: confirm which projects to fetch.
+                    # NOTE: interrupt() must NOT sit inside a try/except — it pauses the graph.
+                    from langgraph.types import interrupt
+                    decision = interrupt({
+                        "type": "rag_scope_confirm",
+                        "candidates": candidate_names,
+                        "all_projects": learned_names,
+                        "query": task,
+                    })
+                    confirmed = _parse_scope_decision(decision, candidate_names, learned_names)
+                    confirmed_scope = confirmed
+                    if not confirmed:
+                        context = "(User declined the cross-project search.)"
+                    else:
+                        try:
+                            scope_note = "Projects searched: " + ", ".join(f"`{c}`" for c in confirmed) + "."
+                            res = retrieve_across_collections(task, confirmed, k_per_collection=8, max_total=40)
+                            context = "\n\n".join(res.context_blocks) if res.context_blocks else "(no matching content found in the selected projects)"
+                            for s in res.sources:
+                                if s not in sources:
+                                    sources.append(s)
+                        except Exception as e:
+                            logger.warning(f"Cross-collection retrieval failed: {e}")
+                            context = f"(cross-project retrieval error: {e})"
     else:
         context = _basic_retrieve(task, collection, sources)
 
@@ -252,9 +282,13 @@ def rag_worker(state: dict) -> dict:
         ),
         context=context,
         task=task,
+        history=state.get("history", ""),
     )
     logger.info(f"[RAG WORKER] Done: {len(result)} chars, {len(sources)} sources")
-    return {"rag_result": result, "rag_sources": sources}
+    out: dict = {"rag_result": result, "rag_sources": sources}
+    if confirmed_scope:
+        out["rag_confirmed_scope"] = confirmed_scope
+    return out
 
 
 def code_worker(state: dict) -> dict:
@@ -310,8 +344,10 @@ def code_worker(state: dict) -> dict:
         ),
     )
 
+    history = state.get("history", "")
+    history_block = f"\n\nPrevious conversation (for follow-up context):\n{history}\n" if history else ""
     try:
-        result = agent.invoke({"messages": [("user", task)]}, config={"recursion_limit": 15})
+        result = agent.invoke({"messages": [("user", f"{task}{history_block}")]}, config={"recursion_limit": 15})
         content = result["messages"][-1].content
     except Exception as e:
         logger.error(f"[CODE WORKER] Agent failed: {e}")
@@ -370,8 +406,10 @@ def db_worker(state: dict) -> dict:
         ),
     )
 
+    db_history = state.get("history", "")
+    db_history_block = f"\n\nPrevious conversation (for follow-up context):\n{db_history}\n" if db_history else ""
     try:
-        result = agent.invoke({"messages": [("user", task)]}, config={"recursion_limit": 15})
+        result = agent.invoke({"messages": [("user", f"{task}{db_history_block}")]}, config={"recursion_limit": 15})
         content = result["messages"][-1].content
     except Exception as e:
         logger.error(f"[DB WORKER] Agent failed: {e}")
@@ -396,6 +434,7 @@ def web_worker(state: dict) -> dict:
         system="You are a web research analyst. Summarize findings comprehensively with source URLs. Include all relevant details, specific facts, numbers, and names. Do NOT be brief.",
         context=str(search_results)[:15000],
         task=task,
+        history=state.get("history", ""),
     )
     import re
     sources = re.findall(r'https?://\S+', str(search_results))[:5]

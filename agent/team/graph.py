@@ -56,6 +56,9 @@ def route_after_plan(state: TeamState) -> list[Send]:
         # No workers needed — go directly to synthesize
         return [Send("synthesize", {})]
 
+    history = state.get("history", "")
+    rag_scope = state.get("rag_confirmed_scope", [])
+    logger.info(f"[GRAPH] route_after_plan: rag_confirmed_scope={rag_scope}")
     sends = []
     for worker_name in workers:
         if worker_name not in WORKER_MAP:
@@ -66,6 +69,8 @@ def route_after_plan(state: TeamState) -> list[Send]:
             "task": task_text,
             "user_query": state.get("user_query", ""),
             "project": state.get("project", ""),
+            "history": history,
+            "rag_confirmed_scope": rag_scope,
         }))
 
     if not sends:
