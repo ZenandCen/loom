@@ -20,8 +20,12 @@ import logging
 import httpx
 import asyncio
 
+from pathlib import Path
+
 from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
 from fastapi.responses import PlainTextResponse
+
+from agent.session import get_session_mgr
 
 logger = logging.getLogger("slack")
 router = APIRouter()
@@ -35,20 +39,6 @@ VERIFY_SIG = os.getenv("SLACK_VERIFY", "true").lower() == "true"
 _processed_events: set[str] = set()
 _event_lock = asyncio.Lock()
 
-# Active session: user_id → checkpoint session_id (persistent until 'new' resets it).
-# This is the conversation memory the user is currently in. It usually equals the
-# Slack thread, but differs when the user resumed an old session or started a 'new' one.
-_active_session: dict[str, str] = {}
-
-# Users who have already confirmed a session (new or resume). Once confirmed, the
-# session picker is NOT shown again until they send !reset. This implements the
-# "keep my session, don't ask me again" behavior.
-_session_confirmed: set[str] = set()
-
-# RAG confirmed scope per thread: thread_id → list of confirmed collection names.
-# Prevents re-asking HITL on follow-up questions within the same conversation.
-_rag_scope_cache: dict[str, list[str]] = {}
-
 # Last raw markdown response per user (for !md copy-paste)
 _last_md_response: dict[str, str] = {}
 
@@ -56,10 +46,6 @@ _last_md_response: dict[str, str] = {}
 _discovered_connections: list[dict] = []  # [{"label": "uri.source", "type": "mysql", "dsn": "mysql://..."}]
 # Discovered databases per connection number (for `db <conn> <db_num>`)
 _discovered_databases: dict[int, list[str]] = {}  # {3: ["db1", "db2", ...]}
-# Pending session-picker responses: user_id → (original_message, timestamp)
-# Keyed by user_id only (thread changes when user replies to the bot's picker).
-_pending_messages: dict[str, tuple[str, float]] = {}
-_PENDING_TTL = 300  # seconds — expire stale pickers so a later "1"/"new" isn't misread
 
 # Pending file import collection choices: thread_ts → {channel_id, user_id, minio_key, filename, mimetype, options, suggested, timestamp}
 _pending_file_imports: dict[str, dict] = {}
@@ -370,27 +356,6 @@ def _get_recent_sessions(exclude_thread: str = "", limit: int = 5) -> list[tuple
         logger.debug(f"Failed to get recent sessions: {e}")
         return []
 
-
-def _format_session_picker(sessions: list[tuple[str, str]], original_msg: str) -> str:
-    """Format the session picker response for Slack.
-
-    Position 1 is the most recent session (the one you were last using) — marked
-    with 📍 so it's clear that's your current/active session.
-    """
-    lines = ["*📋 Session mới* — chưa có conversation history.\n"]
-    if sessions:
-        lines.append("*Sessions:*")
-        for i, (tid, summary) in enumerate(sessions, 1):
-            marker = " 📍" if i == 1 else ""
-            tail = " *(hiện tại)*" if i == 1 else ""
-            lines.append(f"{i}.{marker} `{tid[:14]}` — {summary or '(empty)'}{tail}")
-        lines.append("")
-    lines.append("*Reply:*")
-    if sessions:
-        lines.append(f"• Số (1-{len(sessions)}) → Resume session đó (1 = hiện tại/gần nhất)")
-    lines.append("• `new` → Tiếp tục session mới với câu hỏi: _" + original_msg[:60] + "_")
-    lines.append("• Câu hỏi khác → Session mới với câu hỏi đó")
-    return "\n".join(lines)
 
 
 # ── Config Scanner ────────────────────────────────────────────────────────────
@@ -1115,11 +1080,12 @@ async def process_message(
 
     # Slack thread (where the user is typing) vs active session (checkpoint memory).
     #   - slack_thread: thread_ts if replying in a thread, else this message's event_ts
-    #   - session_id: the conversation memory to read/write. Defaults to slack_thread,
-    #     but is overridden by an active session (resume / 'new').
+    #   - session_id: the conversation memory to read/write. Auto-continues the user's
+    #     last session (stored in Redis). Falls back to slack_thread if no session.
+    mgr = get_session_mgr()
     slack_thread = thread_ts or event_ts
-    session_id = _active_session.get(user_id) or slack_thread
-    thread_id = session_id  # checkpoints + history use the session
+    session_id = mgr.get_session(user_id) or slack_thread
+    thread_id = session_id
     config = {"configurable": {"user_id": user_id, "thread_id": session_id}}
 
     # Command: new / !new / !reset — go to rag_kb (free mode), start a fresh session.
@@ -1127,14 +1093,9 @@ async def process_message(
     if msg.strip().lower() in ("new", "!new", "!reset", "reset"):
         try:
             from agent.tools import reset_project
-            reset_project()  # clear project + DB → collection back to rag_kb
-            _active_session[user_id] = str(time.time())  # fresh session (old history not loaded)
-            _pending_messages.pop(user_id, None)
-            _session_confirmed.discard(user_id)
-            # Clear RAG scope cache for all threads of this user (new session = re-ask)
-            _old_tid = _active_session.get(user_id)
-            for _t in list(_rag_scope_cache.keys()):
-                del _rag_scope_cache[_t]
+            reset_project()
+            mgr.reset_user(user_id)
+            mgr.set_session(user_id, str(time.time()))
             await slack_bot.post_message(
                 channel_id,
                 "🔄 Đã về chế độ **rag_kb** (free). Session mới — không phụ thuộc project.\n"
@@ -1237,18 +1198,13 @@ async def process_message(
             except Exception as e:
                 lines.append(f"• DB error: {e}")
 
-            # Pending messages
-            pending_count = len(_pending_messages)
-            lines.append(f"• Pending session pickers: {pending_count}")
-
             # Thread vs Session — clarify the two concepts:
             #   Slack thread  = the chat thread you're typing in (thread_ts/event_ts)
             #   Active session = the conversation memory (checkpoint) actually in use.
-            # They match normally; they differ after a resume or a 'new'.
             diff_note = "  ⤴ session ≠ Slack thread (đang dùng session khác)" if session_id != slack_thread else ""
             lines.append(f"• Slack thread  : `{slack_thread[:16]}`  (nơi đang chat)")
             lines.append(f"• Active session: `{session_id[:16]}` | User: `{user_id[:8]}`{diff_note}")
-            lines.append(f"• Active sessions (users): {len(_active_session)}")
+            lines.append(f"• Redis: {'✅ connected' if mgr.available else '❌ fallback (in-memory)'}")
 
             await slack_bot.post_message(channel_id, "\n".join(lines), thread_ts=thread_ts)
         except Exception as e:
@@ -1325,25 +1281,19 @@ async def process_message(
                 f"✅ Resumed session `{full_thread_id[:14]}`. Next message will continue that conversation.",
                 thread_ts=thread_ts,
             )
-            # Store the resume target by user_id (works across threads)
-            _active_session[user_id] = full_thread_id
+            # Store the resume target in Redis (works across threads, survives restart)
+            mgr.set_session(user_id, full_thread_id)
 
         except Exception as e:
             await slack_bot.post_message(channel_id, f"Resume error: {e}", thread_ts=thread_ts)
         return
 
-    # Check if this user has a pending/persistent resume
-    if user_id in _active_session:
-        old_thread_id = _active_session[user_id]
-        config["configurable"]["thread_id"] = old_thread_id
-        logger.info(f"RESUME: user={user_id} using old session thread_id={old_thread_id}")
-        # Load full message history from checkpoint_writes
-        history = _load_thread_history(old_thread_id)
-        if history:
-            logger.info(f"RESUME: loaded {len(history)} messages from history")
-            input_messages = history + [{"role": "user", "content": msg}]
-        else:
-            input_messages = [{"role": "user", "content": msg}]
+    # Auto-continue: use the user's active session (from Redis) if available
+    active_session = mgr.get_session(user_id)
+    if active_session:
+        config["configurable"]["thread_id"] = active_session
+        logger.info(f"CONTINUE: user={user_id} session thread_id={active_session}")
+        input_messages = [{"role": "user", "content": msg}]
     else:
         input_messages = [{"role": "user", "content": msg}]
 
@@ -1355,46 +1305,82 @@ async def process_message(
     # Command: list projects ("!projects" or "list projects" or "danh sách project")
     if msg_lower in ("!projects", "!project", "list projects", "danh sách project", "danh sach project"):
         try:
-            from pathlib import Path
-            projects = []
-            skip_dirs = {".venv", "venv", "node_modules", "__pycache__", ".git", ".git_modules", "workspace", "data", "chroma_data"}
-            # Only scan top 2 levels (fast)
+            skip_dirs = {".venv", "venv", "node_modules", "__pycache__", ".git", ".git_modules", "workspace", "data", "chroma_data", ".config", ".cache", ".local", ".npm", ".ollama", ".rustup", ".cargo", ".vscode", ".ssh", ".aws", ".kube", ".docker"}
+            code_exts = {".py", ".ts", ".js", ".go", ".java", ".rs", ".rb", ".php", ".cs", ".scala", ".kt"}
+
+            def _has_code(d):
+                try:
+                    for f in d.iterdir():
+                        if f.is_file() and f.suffix in code_exts:
+                            return True
+                    for f in d.glob("*/*"):
+                        if f.is_file() and f.suffix in code_exts:
+                            return True
+                except (PermissionError, OSError):
+                    pass
+                return False
+
+            # Build tree: {parent: [child, ...]}
+            tree: dict[str, list[str]] = {}  # parent_dir → [project_relative_paths]
+            root_projects: list[str] = []    # projects at root level
+
             for entry in sorted(CODE_BASE_DIR.iterdir()):
                 if not entry.is_dir() or entry.name.startswith("."):
                     continue
                 if entry.name in skip_dirs:
                     continue
-                # Top-level dir with code
+                # Check if top-level dir itself is a project
+                if _has_code(entry):
+                    root_projects.append(entry.name)
+                # Check sub-dirs as projects
+                subs = []
                 try:
-                    has_code = any(entry.glob("*.py")) or any(entry.glob("*.ts")) or any(entry.glob("*.go")) or any(entry.glob("*.java"))
-                    if not has_code:
-                        has_code = any(f.is_file() and f.suffix in (".py", ".ts", ".go", ".java") for f in entry.glob("*/*"))
-                    if has_code:
-                        projects.append(entry.name)
-                except PermissionError:
+                    for sub in sorted(entry.iterdir()):
+                        if not sub.is_dir() or sub.name.startswith("."):
+                            continue
+                        if sub.name in skip_dirs:
+                            continue
+                        if _has_code(sub):
+                            subs.append(str(sub.relative_to(CODE_BASE_DIR)))
+                except (PermissionError, OSError):
                     continue
-                # Sub-level dirs (e.g., DWH/fpt-dwh-reconcile-svc)
-                for sub in sorted(entry.iterdir()):
-                    if not sub.is_dir() or sub.name.startswith("."):
-                        continue
-                    if sub.name in skip_dirs:
-                        continue
-                    try:
-                        has_code = any(sub.glob("*.py")) or any(sub.glob("*.ts")) or any(sub.glob("*.go")) or any(sub.glob("*.java"))
-                        if not has_code:
-                            has_code = any(f.is_file() and f.suffix in (".py", ".ts", ".go", ".java") for f in sub.glob("*/*"))
-                        if has_code:
-                            rel = str(sub.relative_to(CODE_BASE_DIR))
-                            projects.append(rel)
-                    except PermissionError:
-                        continue
-            lines = [f"📁 *Projects* ({len(projects)}):\n"]
-            for i, p in enumerate(projects[:20], 1):
-                lines.append(f"{i}. `{p}`")
-            if len(projects) > 20:
-                lines.append(f"... and {len(projects) - 20} more")
-            lines.append("\nUse: `project <name>` to select")
-            await slack_bot.post_message(channel_id, "\n".join(lines)[:3000], thread_ts=thread_ts)
+                if subs:
+                    tree[entry.name] = subs
+
+            # Format as tree
+            total = len(root_projects) + sum(len(v) for v in tree.values())
+            lines = [f"📁 *Projects* ({total}):\n"]
+            idx = 0
+            shown = 0
+            max_items = 40
+
+            if root_projects:
+                lines.append(f"📂 *{CODE_BASE_DIR.name}/_*")
+                for p in root_projects:
+                    if shown >= max_items:
+                        break
+                    idx += 1
+                    lines.append(f"  {idx}. `{p}`")
+                    shown += 1
+                lines.append("")
+
+            for parent, children in tree.items():
+                if shown >= max_items:
+                    break
+                lines.append(f"📂 *{parent}/_*")
+                for p in children:
+                    if shown >= max_items:
+                        lines.append(f"  ... and {len(children) - shown} more in {parent}/")
+                        break
+                    idx += 1
+                    lines.append(f"  {idx}. `{p}`")
+                    shown += 1
+                lines.append("")
+
+            if total > max_items:
+                lines.append(f"*(showing {max_items}/{total})*")
+            lines.append("\nUse: `project <path>` to select (e.g. `project DWH/fpt-dwh-reconcile-svc`)")
+            await slack_bot.post_message(channel_id, "\n".join(lines)[:39000], thread_ts=thread_ts)
         except Exception as e:
             await slack_bot.post_message(channel_id, f"List projects error: {e}", thread_ts=thread_ts)
         return
@@ -1946,56 +1932,11 @@ async def process_message(
         )
         return
 
-    # ── Session Awareness Gate ──
-    # Keyed by user_id only (NOT thread_id): when the bot posts the picker as a
-    # root message, the user's reply lands in a different thread, so a
-    # user:thread key would never match. The picker is a per-user interaction.
-    # Case A: User is responding to a previous session picker
-    if user_id in _pending_messages:
-        original_msg, pending_ts = _pending_messages.pop(user_id)
-        # Expire stale pickers (user never responded in time)
-        if time.time() - pending_ts > _PENDING_TTL:
-            logger.info(f"Session picker expired for user={user_id}, treating as fresh msg")
-        else:
-            # User engaged with the picker (any response = a decision) → sticky session
-            _session_confirmed.add(user_id)
-            stripped = msg.strip()
-            if stripped.isdigit() and 1 <= int(stripped) <= 5:
-                sessions = _get_recent_sessions(thread_id)
-                if int(stripped) <= len(sessions):
-                    target_tid = sessions[int(stripped) - 1][0]
-                    _active_session[user_id] = target_tid
-                    await slack_bot.post_message(
-                        channel_id,
-                        f"✓ Đã resume session `{target_tid[:14]}`. Hỏi tiếp nhé!",
-                        thread_ts=thread_ts,
-                    )
-                    return
-            elif stripped.lower() in ("new", "tiếp tục", "tiep tục"):
-                msg = original_msg
-                logger.info(f"Session picker: user chose 'new', processing original msg")
-                # fall through to AI processing with original message
-            else:
-                # Treat as a new query — use current msg, discard original
-                logger.info(f"Session picker: user sent new query, discarding original")
-                # fall through to AI processing with new msg
-
-    # Case B: New thread, no history, past sessions exist, AND user hasn't confirmed
-    # a session yet → show picker. Once confirmed, we stop nagging (sticky session).
-    elif (
-        user_id not in _active_session
-        and user_id not in _session_confirmed
-        and not _thread_has_history(thread_id)
-    ):
-        sessions = _get_recent_sessions(thread_id)
-        if sessions:
-            picker_response = _format_session_picker(sessions, msg)
-            await slack_bot.post_message(channel_id, picker_response, thread_ts=thread_ts)
-            _pending_messages[user_id] = (msg, time.time())
-            logger.info(f"Session picker shown for user={user_id}, thread={thread_id}")
-            return
-
-    # Case C: Normal processing (fall through)
+    # ── Auto-continue session ──
+    # Pin the session: once we process a message, store it as the user's active session.
+    # This means follow-up messages (even in different threads) continue the same conversation.
+    # Use !new / !reset to start fresh, or !resume <id> to switch.
+    mgr.set_session(user_id, config["configurable"]["thread_id"])
 
     logger.info(f"AI processing... (User={user_id}, Ch={channel_id}, thread_id={config['configurable']['thread_id']})")
     try:
@@ -2029,29 +1970,36 @@ async def process_message(
         if pending:
             logger.info(f"HITL resume thread={config['configurable']['thread_id']} decision={msg[:80]!r}")
             raw_result = await team.ainvoke(Command(resume=msg), team_config)
-            # After HITL resume, store the confirmed scope in cache for follow-ups
-            _tid = config["configurable"]["thread_id"]
+            # After HITL resume, store the confirmed scope in Redis for follow-ups
             if isinstance(raw_result, dict) and raw_result.get("rag_confirmed_scope"):
-                _rag_scope_cache[_tid] = raw_result["rag_confirmed_scope"]
-                logger.info(f"RAG scope cached for thread={_tid}: {_rag_scope_cache[_tid]}")
+                mgr.set_scope(user_id, raw_result["rag_confirmed_scope"])
+                logger.info(f"RAG scope cached for user={user_id}: {raw_result['rag_confirmed_scope']}")
         else:
             # Build validated input
             project_dir = _get_project_dir()
             project_name = "" if project_dir == CODE_BASE_DIR else project_dir.name
             # Load conversation history from checkpointer (last 3 exchanges)
             history = _load_thread_history_summary(config["configurable"]["thread_id"])
-            _tid = config["configurable"]["thread_id"]
+            # Inject recent image/file attachments (OCR content) into context
+            attachments = mgr.get_attachments(user_id)
+            if attachments:
+                attach_ctx = "\n\nRecent attachments (image/file content the user shared):\n"
+                for att_name, att_content in attachments[:3]:
+                    attach_ctx += f"\n📎 `{att_name}`:\n{att_content[:5000]}\n"
+                history = (history + "\n" if history else "") + attach_ctx
+                logger.info(f"Injected {len(attachments)} attachment(s) into context")
             team_input = TeamInput(
                 user_query=msg,
                 user_id=user_id,
                 project=project_name,
                 history=history,
             )
-            # Inject cached RAG scope to avoid re-asking HITL on follow-ups
+            # Inject cached RAG scope (from Redis, keyed by user_id) to avoid re-asking HITL
             _input_dict = team_input.model_dump()
-            if _tid in _rag_scope_cache:
-                _input_dict["rag_confirmed_scope"] = _rag_scope_cache[_tid]
-                logger.info(f"Injecting cached RAG scope for thread={_tid}: {_rag_scope_cache[_tid]}")
+            cached_scope = mgr.get_scope(user_id)
+            if cached_scope:
+                _input_dict["rag_confirmed_scope"] = cached_scope
+                logger.info(f"Injecting cached RAG scope for user={user_id}: {cached_scope}")
             raw_result = await team.ainvoke(_input_dict, team_config)
 
         # --- Human-in-the-loop: a worker paused to ask for confirmation -> prompt user.
@@ -2083,11 +2031,8 @@ async def process_message(
         result_slack = await slack_bot.post_message(channel_id, response[:39000], thread_ts=thread_ts)
         if result_slack.get("ok"):
             logger.info(f"Message posted to Slack successfully")
-            # Pin the session: once AI responds successfully, lock the user to this
-            # session so follow-up messages (even in different threads) maintain context.
-            # Only cleared by !reset.
-            _active_session[user_id] = session_id
-            _session_confirmed.add(user_id)
+            # Pin session in Redis: follow-ups continue this conversation
+            mgr.set_session(user_id, session_id)
         else:
             logger.error(f"Slack API error for channel={channel_id}: {result_slack}")
 
@@ -2165,6 +2110,81 @@ async def process_slack_files(
             errors.append(f"❌ `{filename}`: download failed ({e})")
             continue
 
+        # ── Images: read content and show to user (no collection picker) ──
+        ext = Path(filename).suffix.lower()
+        is_image = ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".gif"} or mimetype.startswith("image/")
+
+        if is_image:
+            from rag.ocr import vision_classify
+            info = vision_classify(file_bytes)
+
+            # Build display message
+            type_emoji = {
+                "receipt": "🧾", "invoice": "📄", "photo": "📷",
+                "screenshot": "🖥️", "document": "📑", "diagram": "📊",
+                "contract": "✍️", "id_card": "🪪",
+            }.get(info["type"], "🖼️")
+            header = f"{type_emoji} *{info['title'] or filename}*"
+            if info["summary"]:
+                header += f"\n_{info['summary']}_"
+            display_text = ""
+            if info["text"]:
+                display_text = f"\n\nNội dung:\n```\n{info['text'][:3000]}\n```"
+            await slack_bot.post_message(
+                channel_id,
+                header + display_text,
+                thread_ts=thread_ts,
+            )
+
+            # Store in session memory (short-term, for immediate follow-up)
+            try:
+                mgr = get_session_mgr()
+                attach_content = (
+                    f"[{info['type']}] {info['title']}\n{info['summary']}\n\n{info['text']}"
+                )
+                mgr.set_attachment(user_id, filename, attach_content[:10000])
+            except Exception as e:
+                logger.warning(f"Failed to store attachment in session: {e}")
+
+            # Store in RAG vector DB (long-term, for semantic search)
+            try:
+                from datetime import datetime, timezone
+                from langchain_core.documents import Document as LCDocument
+                from rag.indexing import get_vectorstore
+                from agent.tools import get_active_collection
+
+                rag_doc = LCDocument(
+                    page_content=(
+                        f"[{info['type']}] {info['title']}\n"
+                        f"{info['summary']}\n\n"
+                        f"{info['text']}"
+                    ),
+                    metadata={
+                        "source": f"slack:{filename}",
+                        "source_type": "slack_image",
+                        "user_id": user_id,
+                        "image_type": info["type"],
+                        "filename": filename,
+                        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                vs = get_vectorstore(get_active_collection())
+                vs.add_documents([rag_doc])
+                logger.info(f"Image stored in RAG: {filename} → {info['type']}")
+            except Exception as e:
+                logger.warning(f"Failed to store image in RAG: {e}")
+
+            # Store in MinIO for reference
+            try:
+                from api.server import storage
+                file_hash = hashlib.sha256(file_bytes).hexdigest()
+                storage.put(f"slack/{user_id}/{event_ts}_{filename}", file_bytes, content_type=mimetype)
+                storage.put(f"slack/hashes/{file_hash}", b"1", content_type="text/plain")
+            except Exception:
+                pass
+            continue  # Skip collection picker for images
+
+        # ── Documents (PDF, docx, etc.): OCR + collection picker ──
         # Dedup
         file_hash = hashlib.sha256(file_bytes).hexdigest()
         try:

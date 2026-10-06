@@ -92,15 +92,24 @@ except ImportError:
     _ollama_model = None
     _fallback_model = None
 
-_vision_model: ChatOpenAI | None = None
-if os.getenv("LOOM_MODEL_VISION"):
-    _vision_model = ChatOpenAI(
-    model=os.getenv("LOOM_MODEL_VISION", "qwen-vl-max"),
-    api_key=os.environ.get("OPENAI_API_KEY"),
-    base_url="https://code-agent.cads.live/v1",
-    temperature=0,
-    max_tokens=32768,
-)
+_vision_model: "BaseChatModel | None" = None
+_vision_model_name = os.getenv("LOOM_MODEL_VISION", "gemini-2.0-flash")
+if _vision_model_name:
+    if _vision_model_name.startswith("gemini") and _gemini_model is not None:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        _vision_model = ChatGoogleGenerativeAI(
+            model=_vision_model_name,
+            api_key=os.environ.get("GEMINI_API_KEY"),
+            max_output_tokens=8192,
+        )
+    else:
+        _vision_model = ChatOpenAI(
+            model=_vision_model_name,
+            api_key=os.environ.get("OPENAI_API_KEY"),
+            base_url="https://code-agent.cads.live/v1",
+            temperature=0,
+            max_tokens=32768,
+        )
 
 
 # ============================================================

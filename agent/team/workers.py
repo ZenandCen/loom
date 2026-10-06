@@ -102,6 +102,45 @@ def _iterative_llm_call(system: str, context: str, task: str, history: str = "")
     return content.strip()
 
 
+def _retrieve_user_images(task: str, collection: str, user_id: str, k: int = 5) -> str:
+    """Retrieve recent slack images for a user, sorted by recency.
+
+    Searches the vector store for source_type='slack_image' + user_id,
+    then re-ranks by uploaded_at (newest first). Returns formatted context or "".
+    """
+    try:
+        from rag.indexing import get_vectorstore
+        vs = get_vectorstore(collection)
+        results = vs.similarity_search(task, k=k * 3)
+
+        image_docs = [
+            d for d in results
+            if d.metadata.get("source_type") == "slack_image"
+            and d.metadata.get("user_id") == user_id
+        ]
+        if not image_docs:
+            return ""
+
+        # Sort by uploaded_at descending (most recent first)
+        image_docs.sort(
+            key=lambda d: d.metadata.get("uploaded_at", ""),
+            reverse=True,
+        )
+        image_docs = image_docs[:k]
+
+        parts = ["## Recent images shared by user:"]
+        for i, doc in enumerate(image_docs, 1):
+            ftype = doc.metadata.get("image_type", "image")
+            fname = doc.metadata.get("filename", "?")
+            uploaded = doc.metadata.get("uploaded_at", "")
+            parts.append(f"\n[{i}] ({ftype}) {fname} (uploaded: {uploaded})\n{doc.page_content[:3000]}")
+
+        return "\n".join(parts)
+    except Exception as e:
+        logger.debug(f"Image retrieval failed: {e}")
+        return ""
+
+
 def _basic_retrieve(task: str, collection: str, sources: list[str]) -> str:
     """Single-collection retrieval with parent expansion (+ basic fallback)."""
     from rag.retrieval import retrieve_with_parents
@@ -264,6 +303,14 @@ def rag_worker(state: dict) -> dict:
 
     if scope_note:
         context = scope_note + "\n\n" + context
+
+    # Inject recent user images (recency-prioritized) for semantic search
+    user_id = state.get("user_id", "")
+    if user_id:
+        image_ctx = _retrieve_user_images(task, collection, user_id)
+        if image_ctx:
+            context = image_ctx + "\n\n" + context
+            logger.info(f"[RAG WORKER] Injected recent user images into context")
 
     result = _llm_summarize(
         system=(

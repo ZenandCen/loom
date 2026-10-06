@@ -59,33 +59,116 @@ def vision_describe(image_bytes: bytes) -> str:
             return ""
 
         import base64
+        from langchain_core.messages import HumanMessage
         b64_image = base64.b64encode(image_bytes).decode("utf-8")
 
-        message = [
+        msg = HumanMessage([
             {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "Describe this image in detail. If it contains text, transcribe all visible text. "
-                            "If it's a diagram, chart, or table, describe its structure and content. "
-                            "Be comprehensive and factual. Respond in the same language as the text in the image."
-                        ),
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{b64_image}"},
-                    },
-                ],
-            }
-        ]
+                "type": "text",
+                "text": (
+                    "Describe this image in detail. If it contains text, transcribe all visible text. "
+                    "If it's a diagram, chart, or table, describe its structure and content. "
+                    "Be comprehensive and factual. Respond in the same language as the text in the image."
+                ),
+            },
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{b64_image}"},
+            },
+        ])
 
-        result = llm.invoke(message)
-        return result.content.strip()
+        result = llm.invoke([msg])
+        content = result.content
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+        return content.strip()
     except Exception as e:
         logger.warning(f"Vision LLM failed: {e}")
         return ""
+
+
+VISION_CLASSIFY_PROMPT = """\
+Analyze this image and respond in EXACTLY this format (no extra text):
+TYPE: <receipt|invoice|photo|screenshot|document|diagram|contract|id_card|other>
+TITLE: <a short title in Vietnamese, e.g. "Hóa đơn bán hàng - Cà Phê Hoàng Phúc">
+SUMMARY: <1-2 sentence summary in Vietnamese describing what this image is and key details>
+TEXT:
+<full transcription of ALL visible text in the image, preserving line breaks. If no text, write "(no visible text)">
+"""
+
+
+def vision_classify(image_bytes: bytes) -> dict:
+    """Use Vision LLM to classify and describe an image.
+
+    Returns dict with keys:
+        type:    str - image category (receipt, invoice, photo, etc.)
+        title:   str - short Vietnamese title
+        summary: str - 1-2 sentence Vietnamese summary
+        text:    str - full OCR transcription
+    Falls back to Tesseract OCR if Vision LLM is unavailable.
+    """
+    result = {"type": "other", "title": "", "summary": "", "text": ""}
+
+    llm = _get_vision_llm()
+    if llm is not None:
+        try:
+            import base64
+            from langchain_core.messages import HumanMessage
+            b64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+            msg = HumanMessage([
+                {"type": "text", "text": VISION_CLASSIFY_PROMPT},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}},
+            ])
+
+            resp = llm.invoke([msg])
+            content = resp.content
+            if isinstance(content, list):
+                content = "".join(
+                    part.get("text", "") if isinstance(part, dict) else str(part)
+                    for part in content
+                )
+            content = content.strip()
+
+            # Parse structured response
+            current_section = None
+            text_lines: list[str] = []
+            for line in content.split("\n"):
+                line_stripped = line.strip()
+                if line_stripped.startswith("TYPE:"):
+                    current_section = "type"
+                    result["type"] = line_stripped[5:].strip().lower()
+                elif line_stripped.startswith("TITLE:"):
+                    current_section = "title"
+                    result["title"] = line_stripped[6:].strip()
+                elif line_stripped.startswith("SUMMARY:"):
+                    current_section = "summary"
+                    result["summary"] = line_stripped[8:].strip()
+                elif line_stripped.startswith("TEXT:"):
+                    current_section = "text"
+                elif current_section == "text":
+                    text_lines.append(line)
+
+            result["text"] = "\n".join(text_lines).strip()
+
+            # Fallback: if vision didn't extract text, use Tesseract
+            if not result["text"]:
+                result["text"] = ocr_image(image_bytes)
+
+            if result["type"] or result["title"]:
+                logger.info(
+                    f"Vision classify: type={result['type']} title={result['title'][:50]} "
+                    f"text_len={len(result['text'])}"
+                )
+                return result
+
+        except Exception as e:
+            logger.warning(f"Vision classify failed, falling back to OCR: {e}")
+
+    # Fallback: Tesseract only
+    result["text"] = ocr_image(image_bytes)
+    result["title"] = "(OCR only - vision unavailable)"
+    return result
 
 
 def _pdf_has_text(pdf_bytes: bytes) -> bool:

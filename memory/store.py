@@ -1,7 +1,7 @@
-"""PostgreSQL-backed memory store.
+"""PostgreSQL-backed memory store with semantic search.
 
-Implements the LangGraph BaseStore interface backed by PostgreSQL.
-Replaces InMemoryStore for production use — data persists across restarts.
+Implements the LangGraph BaseStore interface backed by PostgreSQL + pgvector.
+Supports hybrid search (vector cosine similarity + keyword ILIKE).
 
 Schema:
     memory_store (
@@ -9,6 +9,7 @@ Schema:
         namespace TEXT[] NOT NULL,
         key TEXT NOT NULL,
         value JSONB NOT NULL,
+        embedding vector(768),
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW(),
         UNIQUE(namespace, key)
@@ -26,6 +27,22 @@ import psycopg2
 import psycopg2.extras
 
 logger = logging.getLogger(__name__)
+
+# Lazy-loaded embedding function (avoids import-time Ollama connection)
+_embedding_fn = None
+
+
+def _get_embeddings():
+    """Lazily load the embedding function from RAG config."""
+    global _embedding_fn
+    if _embedding_fn is None:
+        try:
+            from rag.config import get_embeddings
+            _embedding_fn = get_embeddings()
+        except Exception as e:
+            logger.warning(f"Embeddings unavailable: {e}")
+            _embedding_fn = False
+    return _embedding_fn if _embedding_fn else None
 
 
 @dataclass
@@ -66,15 +83,23 @@ class PostgresStore:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
+                    CREATE EXTENSION IF NOT EXISTS vector
+                """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS memory_store (
                         id BIGSERIAL PRIMARY KEY,
                         namespace TEXT[] NOT NULL,
                         key TEXT NOT NULL,
                         value JSONB NOT NULL,
+                        embedding vector(768),
                         created_at TIMESTAMPTZ DEFAULT NOW(),
                         updated_at TIMESTAMPTZ DEFAULT NOW(),
                         UNIQUE(namespace, key)
                     )
+                """)
+                # Migrate: add embedding column if table existed before
+                cur.execute("""
+                    ALTER TABLE memory_store ADD COLUMN IF NOT EXISTS embedding vector(768)
                 """)
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_memory_namespace
@@ -84,22 +109,50 @@ class PostgresStore:
                     CREATE INDEX IF NOT EXISTS idx_memory_namespace_prefix
                     ON memory_store (namespace)
                 """)
-        logger.info("Schema verified")
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_memory_embedding
+                    ON memory_store USING ivfflat (embedding vector_cosine_ops)
+                """)
+        logger.info("Schema verified (with pgvector)")
+
+    def _generate_embedding(self, key: str, value: dict[str, Any]) -> list[float] | None:
+        """Generate embedding for key+value text."""
+        emb = _get_embeddings()
+        if emb is None:
+            return None
+        try:
+            text = f"{key}: {json.dumps(value, ensure_ascii=False)}"[:2000]
+            return emb.embed_query(text)
+        except Exception as e:
+            logger.debug(f"Embedding generation failed: {e}")
+            return None
 
     def put(self, namespace: tuple[str, ...], key: str, value: dict[str, Any]) -> None:
-        """Insert or update an item."""
+        """Insert or update an item (with embedding)."""
         ns = list(namespace)
+        embedding = self._generate_embedding(key, value)
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    INSERT INTO {self.table} (namespace, key, value, updated_at)
-                    VALUES (%s, %s, %s, NOW())
-                    ON CONFLICT (namespace, key)
-                    DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
-                    """,
-                    (ns, key, json.dumps(value)),
-                )
+                if embedding:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {self.table} (namespace, key, value, embedding, updated_at)
+                        VALUES (%s, %s, %s, %s, NOW())
+                        ON CONFLICT (namespace, key)
+                        DO UPDATE SET value = EXCLUDED.value, embedding = EXCLUDED.embedding, updated_at = NOW()
+                        """,
+                        (ns, key, json.dumps(value), str(embedding)),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {self.table} (namespace, key, value, updated_at)
+                        VALUES (%s, %s, %s, NOW())
+                        ON CONFLICT (namespace, key)
+                        DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                        """,
+                        (ns, key, json.dumps(value)),
+                    )
         logger.debug(f"PUT {ns}/{key}")
 
     def get(self, namespace: tuple[str, ...], key: str) -> Item | None:
@@ -129,24 +182,17 @@ class PostgresStore:
         limit: int = 10,
         **kwargs,
     ) -> list[SearchItem]:
-        """Search items by namespace prefix + keyword in value."""
+        """Hybrid search: vector cosine similarity + keyword ILIKE.
+
+        If query is provided and embeddings are available, uses vector search
+        merged with keyword results. Falls back to keyword-only if no embeddings.
+        """
         ns = list(namespace)
         ns_len = len(ns)
-        with self._conn() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                if query:
-                    cur.execute(
-                        f"""
-                        SELECT namespace, key, value, created_at, updated_at
-                        FROM {self.table}
-                        WHERE namespace[1:%s] = %s
-                        AND (value::text ILIKE %s OR key ILIKE %s)
-                        ORDER BY updated_at DESC
-                        LIMIT %s
-                        """,
-                        (ns_len, ns, f"%{query}%", f"%{query}%", limit),
-                    )
-                else:
+
+        if not query:
+            with self._conn() as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute(
                         f"""
                         SELECT namespace, key, value, created_at, updated_at
@@ -157,9 +203,72 @@ class PostgresStore:
                         """,
                         (ns_len, ns, limit),
                     )
-                rows = cur.fetchall()
+                    rows = cur.fetchall()
+            return [
+                SearchItem(
+                    namespace=tuple(r["namespace"]),
+                    key=r["key"],
+                    value=r["value"],
+                    created_at=str(r["created_at"]),
+                    updated_at=str(r["updated_at"]),
+                )
+                for r in rows
+            ]
 
-        return [
+        # Hybrid: try vector + keyword, merge results
+        vector_results: list[SearchItem] = []
+        keyword_results: list[SearchItem] = []
+
+        # Vector search
+        emb = _get_embeddings()
+        if emb:
+            try:
+                query_vec = emb.embed_query(query[:2000])
+                with self._conn() as conn:
+                    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                        cur.execute(
+                            f"""
+                            SELECT namespace, key, value, created_at, updated_at,
+                                   1 - (embedding <=> %s::vector) AS score
+                            FROM {self.table}
+                            WHERE namespace[1:%s] = %s
+                            AND embedding IS NOT NULL
+                            ORDER BY embedding <=> %s::vector
+                            LIMIT %s
+                            """,
+                            (str(query_vec), ns_len, ns, str(query_vec), limit * 2),
+                        )
+                        rows = cur.fetchall()
+                vector_results = [
+                    SearchItem(
+                        namespace=tuple(r["namespace"]),
+                        key=r["key"],
+                        value=r["value"],
+                        created_at=str(r["created_at"]),
+                        updated_at=str(r["updated_at"]),
+                        score=float(r["score"]),
+                    )
+                    for r in rows
+                ]
+            except Exception as e:
+                logger.debug(f"Vector search failed, falling back to keyword: {e}")
+
+        # Keyword search (always run as fallback/complement)
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    f"""
+                    SELECT namespace, key, value, created_at, updated_at
+                    FROM {self.table}
+                    WHERE namespace[1:%s] = %s
+                    AND (value::text ILIKE %s OR key ILIKE %s)
+                    ORDER BY updated_at DESC
+                    LIMIT %s
+                    """,
+                    (ns_len, ns, f"%{query}%", f"%{query}%", limit * 2),
+                )
+                rows = cur.fetchall()
+        keyword_results = [
             SearchItem(
                 namespace=tuple(r["namespace"]),
                 key=r["key"],
@@ -169,6 +278,21 @@ class PostgresStore:
             )
             for r in rows
         ]
+
+        # Merge: vector results first (scored), then keyword-only (deduped)
+        seen_keys: set[tuple[str, str]] = set()
+        merged: list[SearchItem] = []
+        for item in vector_results:
+            ident = (str(item.namespace), item.key)
+            if ident not in seen_keys:
+                seen_keys.add(ident)
+                merged.append(item)
+        for item in keyword_results:
+            ident = (str(item.namespace), item.key)
+            if ident not in seen_keys:
+                seen_keys.add(ident)
+                merged.append(item)
+        return merged[:limit]
 
     def list_namespaces(self, prefix: tuple[str, ...] = (), limit: int = 100) -> list[tuple[str, ...]]:
         """List all unique namespaces, optionally filtered by prefix."""

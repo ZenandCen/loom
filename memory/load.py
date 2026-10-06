@@ -1,7 +1,6 @@
 """Load memory from store — use as a node in StateGraph wrapper (optional).
 
-In Deep Agents, memory is handled natively via /memories/ path.
-This module is for the optional StateGraph wrapper pattern.
+Uses hybrid search (vector + keyword) for semantic recall.
 """
 
 from langgraph.config import get_config
@@ -10,7 +9,7 @@ from agent.config import store
 
 
 def load_memory(state: dict) -> dict:
-    """Load relevant memories for the current user into state."""
+    """Load relevant memories for the current user into state (semantic search)."""
     config = get_config()
     user_id = config.get("configurable", {}).get("user_id", "default")
 
@@ -19,8 +18,16 @@ def load_memory(state: dict) -> dict:
     if profile:
         state["user_profile"] = profile.value
 
-    # Load recent context
-    context_items = store.search(("loom", user_id), query=state.get("messages", [])[-1].content if state.get("messages") else "", limit=5)
-    state["relevant_memories"] = [item.value["fact"] for item in context_items]
+    # Semantic search for relevant context (vector + keyword hybrid)
+    query = ""
+    if state.get("messages"):
+        last_msg = state["messages"][-1]
+        query = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+
+    if query:
+        context_items = store.search(("loom", user_id), query=query[:500], limit=5)
+        state["relevant_memories"] = [item.value.get("fact", str(item.value)) for item in context_items]
+    else:
+        state["relevant_memories"] = []
 
     return state

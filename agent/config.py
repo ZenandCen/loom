@@ -162,6 +162,10 @@ except Exception:
     from langgraph.store.memory import InMemoryStore
     store = InMemoryStore()
 
+# Session Manager: Redis-backed session state (survives restarts)
+from agent.session import init_session_manager
+session_mgr = init_session_manager()
+
 # --- Backend (Composite — hybrid storage) ---
 from deepagents.backends import (
     StateBackend,
